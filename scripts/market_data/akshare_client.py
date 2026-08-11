@@ -18,6 +18,8 @@ except ImportError:  # pragma: no cover - production installs this from requirem
 
 T = TypeVar("T")
 TRANSIENT_ERRORS = (TimeoutError, ConnectionError, socket.timeout, URLError)
+SH_A_SHARE_PREFIXES = ("600", "601", "603", "605", "688")
+SZ_A_SHARE_PREFIXES = ("000", "001", "002", "003", "300", "301")
 
 
 class MarketDataUnavailable(RuntimeError):
@@ -104,6 +106,10 @@ class AkshareClient:
         return pd.concat([shanghai, shenzhen], ignore_index=True)
 
     def get_stock_history(self, symbol: str, start: str, end: str) -> pd.DataFrame:
+        if not self._is_a_share_symbol(symbol):
+            raise ValueError(
+                f"{symbol!r} is not an eligible Shanghai or Shenzhen A-share symbol"
+            )
         frame = self._with_retry(
             lambda: self._require_api().stock_zh_a_hist(
                 symbol=symbol,
@@ -141,12 +147,18 @@ class AkshareClient:
             "current_close"
         ].le(0)
 
-        prefixes = (
-            ("600", "601", "603", "605", "688")
-            if exchange == "SH"
-            else ("000", "001", "002", "003", "300", "301")
-        )
+        prefixes = SH_A_SHARE_PREFIXES if exchange == "SH" else SZ_A_SHARE_PREFIXES
         return result.loc[result["symbol"].str.startswith(prefixes)].reset_index(drop=True)
+
+    @staticmethod
+    def _is_a_share_symbol(symbol: str) -> bool:
+        normalized = str(symbol).strip()
+        return (
+            len(normalized) == 6
+            and normalized.isascii()
+            and normalized.isdigit()
+            and normalized.startswith(SH_A_SHARE_PREFIXES + SZ_A_SHARE_PREFIXES)
+        )
 
     @staticmethod
     def _normalize(

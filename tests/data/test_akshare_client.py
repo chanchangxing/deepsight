@@ -149,6 +149,30 @@ def test_get_stock_history_uses_unadjusted_daily_prices_and_normalizes_columns()
     }
 
 
+@pytest.mark.parametrize("symbol", ["900901", "200001", "430047", "510300"])
+def test_get_stock_history_rejects_non_a_share_symbols_before_fetching(symbol):
+    class RecordingApi:
+        def __init__(self):
+            self.history_calls = []
+
+        def stock_zh_a_hist(self, **kwargs):
+            self.history_calls.append(kwargs)
+            return pd.DataFrame(
+                {
+                    "日期": ["2025-01-02"],
+                    "股票代码": [symbol],
+                    "收盘": [10.5],
+                }
+            )
+
+    api = RecordingApi()
+
+    with pytest.raises(ValueError, match="not an eligible Shanghai or Shenzhen A-share"):
+        AkshareClient(api=api).get_stock_history(symbol, "2025-01-01", "2025-01-03")
+
+    assert api.history_calls == []
+
+
 def test_schema_changes_raise_without_retrying():
     class BrokenApi:
         def stock_zh_index_daily_em(self, **kwargs):
