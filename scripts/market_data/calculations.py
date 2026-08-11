@@ -7,6 +7,8 @@ def classify_breadth(frame: pd.DataFrame) -> BreadthCounts:
     current = pd.to_numeric(frame["current_close"], errors="raise")
     previous = pd.to_numeric(frame["previous_close"], errors="raise")
     valid = current.notna() & previous.notna() & current.gt(0) & previous.gt(0)
+    if "is_suspended" in frame:
+        valid &= ~frame["is_suspended"].fillna(False)
     current = current[valid]
     previous = previous[valid]
 
@@ -20,9 +22,15 @@ def classify_breadth(frame: pd.DataFrame) -> BreadthCounts:
 
 def add_cumulative_diff(frame: pd.DataFrame) -> pd.DataFrame:
     result = frame.sort_values("date").reset_index(drop=True).copy()
-    result["cumulative_diff"] = pd.to_numeric(
-        result["daily_diff"], errors="raise"
-    ).astype(int).cumsum()
+    if {"up_count", "down_count"}.issubset(result.columns):
+        up_count = pd.to_numeric(result["up_count"], errors="raise").astype(int)
+        down_count = pd.to_numeric(result["down_count"], errors="raise").astype(int)
+        result["daily_diff"] = up_count - down_count
+    else:
+        result["daily_diff"] = pd.to_numeric(
+            result["daily_diff"], errors="raise"
+        ).astype(int)
+    result["cumulative_diff"] = result["daily_diff"].cumsum()
     return result
 
 

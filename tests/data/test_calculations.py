@@ -22,11 +22,39 @@ def test_classify_breadth_excludes_missing_previous_close():
     assert classify_breadth(frame) == BreadthCounts(up=1, down=1, flat=1, valid=3)
 
 
+def test_classify_breadth_excludes_suspended_stocks():
+    frame = pd.DataFrame(
+        {
+            "current_close": [11.0, 9.0, 10.0, 10.0],
+            "previous_close": [10.0, 10.0, 10.0, 10.0],
+            "is_suspended": [False, False, True, False],
+        }
+    )
+
+    assert classify_breadth(frame) == BreadthCounts(up=1, down=1, flat=1, valid=3)
+
+
 def test_add_cumulative_diff_rebuilds_from_zero():
     frame = pd.DataFrame(
         {"date": ["2025-01-02", "2025-01-03", "2025-01-06"], "daily_diff": [10, 10, -5]}
     )
     assert add_cumulative_diff(frame)["cumulative_diff"].tolist() == [10, 20, 15]
+
+
+def test_add_cumulative_diff_derives_daily_diff_from_breadth_counts():
+    frame = pd.DataFrame(
+        {
+            "date": ["2025-01-03", "2025-01-02"],
+            "up_count": [5, 3],
+            "down_count": [7, 1],
+            "daily_diff": [999, 999],
+        }
+    )
+
+    result = add_cumulative_diff(frame)
+
+    assert result["daily_diff"].tolist() == [2, -2]
+    assert result["cumulative_diff"].tolist() == [2, 0]
 
 
 def test_calculate_index_changes_uses_adjacent_closes():
