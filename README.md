@@ -1,100 +1,54 @@
-# vinext-starter
+# A-share market breadth
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+This site charts the daily breadth of eligible Shanghai and Shenzhen A shares
+against the Shanghai Composite Index.
 
-## Prerequisites
+## Statistical definition
 
-- Node.js `>=22.13.0`
+The universe covers ordinary A-share symbols on the Shanghai and Shenzhen
+exchanges. It excludes other exchange instruments and keeps delisted securities
+in history through their delisting date. Suspended securities and prices without
+a valid prior close are excluded from that day's comparison.
 
-## Quick Start
+For each trading day, `daily_diff = up_count - down_count`. The displayed
+cumulative breadth is the running sum:
+
+```
+cumulative_diff[t] = cumulative_diff[t - 1] + daily_diff[t]
+```
+
+The close and trading-day calendar come from the Shanghai Composite Index.
+
+## Data publication and automatic updates
+
+GitHub Actions runs on weekdays at 15:35 and 17:05 Beijing time (the UTC cron
+values are `35 7 * * 1-5` and `5 9 * * 1-5`). The two windows accommodate
+post-close source availability. Each run refreshes the recent trading days,
+validates the complete data pipeline, and creates a commit only when published
+data actually changed.
+
+The AKShare client retries transient network and rate-limit failures with delays
+of 30, 90, and 180 seconds. A failed fetch or validation fails the Action and
+does not advance the published version pointer, so the previous release remains
+available. Inspect the failed run in the repository's **Actions** tab for the
+command and error output before retrying.
+
+Published files are immutable under `public/data/versions/<uuid>/`. The
+`public/data/current.json` manifest is the version pointer consumed by the site;
+it changes only after a new version has been fully written. Do not treat a fixed
+`data/` CSV as the source of the live release.
+
+To recover historical data, open **Actions → Update market breadth data → Run
+workflow**, tick **full**, and run it. This rebuilds history from 2025-01-01.
+
+## Local commands
 
 ```bash
+python -m pip install -r requirements.txt
+python scripts/update_market_data.py          # routine refresh
+python scripts/update_market_data.py --full   # full rebuild from 2025-01-01
+python -m pytest tests/data -v                # offline data and workflow tests
 npm install
-npm run dev
+npm test -- --run
 npm run build
 ```
-
-This starter does not use `wrangler.jsonc`.
-
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-Signed-in visitors receive both `oai-authenticated-user-id` and `oai-authenticated-user-email`. Private Sites require every visitor to sign in; public Sites may also have anonymous visitors, for whom neither header is present.
-
-The user ID is stable for the same user on the same Site and different across Sites. Email and name are intended for display or contact purposes.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const userId = requestHeaders.get("oai-authenticated-user-id");
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
-```
-
-## Optional Dispatch-Owned ChatGPT Sign-In
-
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
-
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
