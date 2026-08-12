@@ -146,20 +146,20 @@ class HistoryShapeApi:
     def __init__(self, fixture):
         self.fixture = fixture
 
-    def stock_zh_a_hist(self, **kwargs):
-        symbol = kwargs["symbol"]
+    def stock_zh_a_daily(self, **kwargs):
+        symbol = kwargs["symbol"][2:]
         frame = FixtureClient.get_stock_history(
             self.fixture, symbol, "2024-12-31", "2025-01-07"
         )
         result = frame.rename(
-            columns={"date": "日期", "symbol": "股票代码", "current_close": "收盘"}
-        ).loc[:, ["日期", "股票代码", "收盘"]]
-        result["成交量"] = 100.0
-        result["成交额"] = 1000.0
+            columns={"current_close": "close"}
+        ).loc[:, ["date", "close"]]
+        result["volume"] = 100.0
+        result["amount"] = 1000.0
         if symbol == "600000":
-            suspended = result["日期"] == "2025-01-06"
-            result.loc[suspended, "成交量"] = 0.0
-            result.loc[suspended, "成交额"] = 0.0
+            suspended = result["date"] == "2025-01-06"
+            result.loc[suspended, "volume"] = 0.0
+            result.loc[suspended, "amount"] = 0.0
         return result
 
 

@@ -2,6 +2,7 @@ from urllib.error import HTTPError
 
 import pandas as pd
 import pytest
+from requests.exceptions import ProxyError
 
 from scripts.market_data.akshare_client import (
     AkshareClient,
@@ -14,9 +15,26 @@ SAMPLE_FRAME = pd.DataFrame({"date": ["2025-01-02"], "close": [3_200.0]})
 
 
 class FakeAkshareApi:
+    def stock_zh_index_daily(self, **kwargs):
+        self.index_daily_request = kwargs
+        return pd.DataFrame(
+            {
+                "date": ["2024-12-31", "2025-01-02", "2025-01-06"],
+                "close": [3_190.0, 3_200.0, 3_210.0],
+            }
+        )
+
     def stock_zh_index_daily_em(self, **kwargs):
         self.index_request = kwargs
         return pd.DataFrame({"日期": ["2025-01-02"], "收盘": [3_200.0]})
+
+    def stock_info_a_code_name(self):
+        return pd.DataFrame(
+            {
+                "code": ["600000", "688001", "000001", "300001", "430047"],
+                "name": ["浦发银行", "科创板", "平安银行", "创业板", "北交所"],
+            }
+        )
 
     def stock_sh_a_spot_em(self):
         return pd.DataFrame(
@@ -47,6 +65,17 @@ class FakeAkshareApi:
                 "收盘": [10.0, 10.0, 10.0, 11.0],
                 "成交量": [100.0, 0.0, 0.0, 0.0],
                 "成交额": [1000.0, 0.0, 1000.0, None],
+            }
+        )
+
+    def stock_zh_a_daily(self, **kwargs):
+        self.daily_history_request = kwargs
+        return pd.DataFrame(
+            {
+                "date": ["2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07"],
+                "close": [10.0, 10.0, 10.0, 11.0],
+                "volume": [100.0, 0.0, 0.0, 0.0],
+                "amount": [1000.0, 0.0, 1000.0, None],
             }
         )
 
@@ -118,6 +147,21 @@ def test_retry_retries_rate_limited_http_requests():
     assert delays == [30]
 
 
+def test_retry_retries_transient_proxy_disconnects():
+    outcomes = iter([ProxyError("proxy disconnected"), SAMPLE_FRAME])
+    delays = []
+    client = AkshareClient(api=object(), sleeper=delays.append)
+
+    def operation():
+        outcome = next(outcomes)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    assert client._with_retry(operation) is SAMPLE_FRAME
+    assert delays == [30]
+
+
 def test_retry_does_not_retry_non_transient_errors():
     delays = []
     client = AkshareClient(api=object(), sleeper=delays.append)
@@ -133,11 +177,7 @@ def test_get_index_history_normalizes_dates_closes_and_request_parameters():
     result = AkshareClient(api=api).get_index_history("2025-01-01", "2025-01-03")
 
     assert result.to_dict("records") == [{"date": "2025-01-02", "close": 3_200.0}]
-    assert api.index_request == {
-        "symbol": "sh000001",
-        "start_date": "20250101",
-        "end_date": "20250103",
-    }
+    assert api.index_daily_request == {"symbol": "sh000001"}
 
 
 def test_current_market_filters_to_shanghai_and_shenzhen_a_shares():
@@ -166,6 +206,26 @@ def test_security_universe_merges_current_and_delisted_a_shares_with_lifecycle_d
     ]
 
 
+def test_security_universe_does_not_depend_on_eastmoney_spot_pages():
+    class ExchangeListApi(FakeAkshareApi):
+        def stock_sh_a_spot_em(self):
+            raise AssertionError("Eastmoney spot endpoint must not be called")
+
+        def stock_sz_a_spot_em(self):
+            raise AssertionError("Eastmoney spot endpoint must not be called")
+
+    result = AkshareClient(api=ExchangeListApi()).get_security_universe()
+
+    assert set(result["symbol"]) == {
+        "000001",
+        "000999",
+        "300001",
+        "600000",
+        "600999",
+        "688001",
+    }
+
+
 def test_get_stock_history_uses_unadjusted_daily_prices_and_normalizes_columns():
     api = FakeAkshareApi()
     result = AkshareClient(api=api).get_stock_history(
@@ -179,9 +239,8 @@ def test_get_stock_history_uses_unadjusted_daily_prices_and_normalizes_columns()
         {"date": "2025-01-06", "symbol": "600000", "current_close": 10.0, "volume": 0.0},
         {"date": "2025-01-07", "symbol": "600000", "current_close": 11.0, "volume": 0.0},
     ]
-    assert api.history_request == {
-        "symbol": "600000",
-        "period": "daily",
+    assert api.daily_history_request == {
+        "symbol": "sh600000",
         "start_date": "20250101",
         "end_date": "20250103",
         "adjust": "",
@@ -214,7 +273,7 @@ def test_get_stock_history_rejects_non_a_share_symbols_before_fetching(symbol):
 
 def test_schema_changes_raise_without_retrying():
     class BrokenApi:
-        def stock_zh_index_daily_em(self, **kwargs):
+        def stock_zh_index_daily(self, **kwargs):
             return pd.DataFrame({"日期": ["2025-01-02"]})
 
     client = AkshareClient(api=BrokenApi(), sleeper=lambda _: pytest.fail("retried"))

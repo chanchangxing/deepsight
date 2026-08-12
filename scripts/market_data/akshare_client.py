@@ -76,18 +76,20 @@ class AkshareClient:
         return (
             error.__class__.__module__.startswith("requests")
             and error.__class__.__name__
-            in {"Timeout", "ConnectTimeout", "ReadTimeout", "ConnectionError"}
+            in {
+                "Timeout",
+                "ConnectTimeout",
+                "ReadTimeout",
+                "ConnectionError",
+                "ProxyError",
+            }
         )
 
     def get_index_history(self, start: str, end: str) -> pd.DataFrame:
         frame = self._with_retry(
-            lambda: self._require_api().stock_zh_index_daily_em(
-                symbol="sh000001",
-                start_date=self._api_date(start),
-                end_date=self._api_date(end),
-            )
+            lambda: self._require_api().stock_zh_index_daily(symbol="sh000001")
         )
-        return self._normalize(
+        result = self._normalize(
             frame,
             {
                 "date": ("date", "日期"),
@@ -95,6 +97,9 @@ class AkshareClient:
             },
             numeric_columns=("close",),
         )
+        return result.loc[
+            result["date"].between(start, end), ["date", "close"]
+        ].reset_index(drop=True)
 
     def get_current_market(self) -> pd.DataFrame:
         shanghai = self._normalize_market(
@@ -107,7 +112,21 @@ class AkshareClient:
 
     def get_security_universe(self) -> pd.DataFrame:
         """Return current and delisted eligible A shares with lifecycle boundaries."""
-        current = self.get_current_market().loc[:, ["symbol", "exchange"]].copy()
+        current = self._normalize(
+            self._with_retry(lambda: self._require_api().stock_info_a_code_name()),
+            {
+                "symbol": ("symbol", "code", "证券代码", "A股代码"),
+                "name": ("name", "证券简称", "A股简称"),
+            },
+        )
+        current["symbol"] = current["symbol"].astype(str).str.zfill(6)
+        current = current.loc[
+            current["symbol"].map(self._is_a_share_symbol)
+        ].copy()
+        current["exchange"] = current["symbol"].map(
+            lambda symbol: "SH" if symbol.startswith(SH_A_SHARE_PREFIXES) else "SZ"
+        )
+        current = current.loc[:, ["symbol", "exchange"]]
         current["listing_date"] = None
         current["delisting_date"] = None
         shanghai = self._normalize_delisted_market(
@@ -143,9 +162,9 @@ class AkshareClient:
                 f"{symbol!r} is not an eligible Shanghai or Shenzhen A-share symbol"
             )
         frame = self._with_retry(
-            lambda: self._require_api().stock_zh_a_hist(
-                symbol=symbol,
-                period="daily",
+            lambda: self._require_api().stock_zh_a_daily(
+                symbol=("sh" if symbol.startswith(SH_A_SHARE_PREFIXES) else "sz")
+                + symbol,
                 start_date=self._api_date(start),
                 end_date=self._api_date(end),
                 adjust="",
@@ -155,13 +174,13 @@ class AkshareClient:
             frame,
             {
                 "date": ("date", "日期"),
-                "symbol": ("symbol", "股票代码", "代码"),
-                "current_close": ("current_close", "收盘"),
+                "current_close": ("current_close", "close", "收盘"),
                 "volume": ("volume", "成交量"),
                 "amount": ("amount", "成交额"),
             },
             numeric_columns=("current_close", "volume", "amount"),
         )
+        result["symbol"] = symbol
         result["is_suspended"] = result["volume"].eq(0) & result["amount"].eq(0)
         return result
 
