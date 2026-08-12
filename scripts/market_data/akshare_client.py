@@ -180,6 +180,7 @@ class AkshareClient:
                     start_date=self._api_date(start),
                     end_date=self._api_date(end),
                     adjust="",
+                    timeout=20,
                 )
             )
         result = self._normalize(

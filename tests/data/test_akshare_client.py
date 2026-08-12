@@ -268,6 +268,7 @@ def test_get_stock_history_falls_back_when_sina_returns_non_json_for_delisted_st
         "start_date": "20250101",
         "end_date": "20250103",
         "adjust": "",
+        "timeout": 20,
     }
 
 
