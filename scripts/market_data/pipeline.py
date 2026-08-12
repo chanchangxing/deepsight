@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -129,6 +130,10 @@ class MarketDataPipeline:
         combined = add_cumulative_diff(combined).loc[:, REQUIRED_COLUMNS]
         validate_history(combined)
         self._atomic_publish(combined)
+        checkpoint_directory = self._checkpoint_directory(
+            (HISTORY_START - timedelta(days=1)).isoformat(), as_of.isoformat()
+        )
+        shutil.rmtree(checkpoint_directory, ignore_errors=True)
         return UpdateResult(tuple(dates_to_update))
 
     def _read_history(self) -> pd.DataFrame:
@@ -136,7 +141,10 @@ class MarketDataPipeline:
         if self.manifest_path.exists():
             try:
                 manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
-                source = self.public_data_path / manifest["csv"]
+                history_csv = manifest.get("history_csv", manifest.get("csv"))
+                if not isinstance(history_csv, str):
+                    raise KeyError("history_csv")
+                source = self.public_data_path / history_csv
             except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
                 raise MarketDataValidationError(f"cannot read current manifest: {error}") from error
         if not source.exists():
@@ -189,7 +197,9 @@ class MarketDataPipeline:
         history_start = (HISTORY_START - timedelta(days=1)).isoformat()
         histories = []
         for symbol in market["symbol"]:
-            history = self.client.get_stock_history(symbol, history_start, as_of.isoformat()).copy()
+            history = self._stock_history(
+                symbol, history_start, as_of.isoformat()
+            ).copy()
             if not {"date", "current_close"}.issubset(history.columns):
                 raise MarketDataValidationError(f"stock history is incomplete for {symbol}")
             history["symbol"] = symbol
@@ -279,6 +289,46 @@ class MarketDataPipeline:
             )
         return pd.DataFrame(records, columns=REQUIRED_COLUMNS)
 
+    def _stock_history(self, symbol: str, start: str, end: str) -> pd.DataFrame:
+        checkpoint_path = self._checkpoint_directory(start, end) / f"{symbol}.csv"
+        if checkpoint_path.exists():
+            try:
+                checkpoint = pd.read_csv(
+                    checkpoint_path,
+                    dtype={"date": str, "symbol": str},
+                )
+                if not {
+                    "date",
+                    "symbol",
+                    "current_close",
+                    "is_suspended",
+                }.issubset(checkpoint.columns):
+                    raise ValueError("checkpoint schema is incomplete")
+                if not checkpoint["symbol"].astype(str).str.zfill(6).eq(symbol).all():
+                    raise ValueError("checkpoint symbol does not match")
+                return checkpoint
+            except (OSError, ValueError, pd.errors.ParserError):
+                pass
+
+        history = self.client.get_stock_history(symbol, start, end).copy()
+        if not {"date", "current_close", "is_suspended"}.issubset(history.columns):
+            raise MarketDataValidationError(f"stock history is incomplete for {symbol}")
+        history["symbol"] = symbol
+        checkpoint = history.loc[
+            :, ["date", "symbol", "current_close", "is_suspended"]
+        ]
+        payload = checkpoint.to_csv(index=False).encode("utf-8")
+        checkpoint_temp = self._write_temp(checkpoint_path, payload)
+        try:
+            os.replace(checkpoint_temp, checkpoint_path)
+            self._fsync_directory(checkpoint_path.parent)
+        finally:
+            checkpoint_temp.unlink(missing_ok=True)
+        return checkpoint
+
+    def _checkpoint_directory(self, start: str, end: str) -> Path:
+        return self.root / "work" / "market-data-checkpoints" / f"{start}_{end}"
+
     def _validate_daily_quality(
         self,
         value: str,
@@ -328,8 +378,8 @@ class MarketDataPipeline:
             self._fsync_directory(version_path)
             manifest = {
                 "version": version,
-                "csv": f"versions/{version}/market_history.csv",
-                "json": f"versions/{version}/market_history.json",
+                "history_csv": f"versions/{version}/market_history.csv",
+                "history_json": f"versions/{version}/market_history.json",
             }
             manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
             manifest_temp = self._write_temp(self.manifest_path, manifest_bytes)

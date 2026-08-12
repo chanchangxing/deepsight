@@ -127,6 +127,21 @@ class FixtureClient:
         return frame.loc[~((frame["symbol"].isin(self.omit_symbols)) & (frame["date"].isin(self.invalid_on)))].reset_index(drop=True)
 
 
+class FailsOnceDuringStockHistoryClient(FixtureClient):
+    def __init__(self):
+        super().__init__()
+        self.failed = False
+
+    def get_stock_history(self, symbol, start, end):
+        self.history_requests.append((symbol, start, end))
+        if symbol == "000001" and not self.failed:
+            self.failed = True
+            raise RuntimeError("simulated interrupted stock history request")
+        history = FixtureClient.get_stock_history(self, symbol, start, end)
+        self.history_requests.pop()
+        return history
+
+
 class HistoryShapeApi:
     def __init__(self, fixture):
         self.fixture = fixture
@@ -168,7 +183,49 @@ def make_pipeline(tmp_path: Path, client=None) -> MarketDataPipeline:
 def published_paths(tmp_path):
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
     public_data = tmp_path / "public/data"
-    return public_data / manifest["csv"], public_data / manifest["json"]
+    return (
+        public_data / manifest["history_csv"],
+        public_data / manifest["history_json"],
+    )
+
+
+def test_published_manifest_uses_canonical_history_path_keys(tmp_path):
+    make_pipeline(tmp_path).run(date(2025, 1, 2))
+
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+
+    assert set(manifest) == {"version", "history_csv", "history_json"}
+    assert manifest["history_csv"] == (
+        f"versions/{manifest['version']}/market_history.csv"
+    )
+    assert manifest["history_json"] == (
+        f"versions/{manifest['version']}/market_history.json"
+    )
+
+
+def test_full_run_resumes_completed_stock_history_after_failure(tmp_path):
+    client = FailsOnceDuringStockHistoryClient()
+
+    with pytest.raises(RuntimeError, match="simulated interrupted"):
+        make_pipeline(tmp_path, client).run(date(2025, 1, 6), full=True)
+
+    make_pipeline(tmp_path, client).run(date(2025, 1, 6), full=True)
+
+    requested_symbols = [symbol for symbol, _, _ in client.history_requests]
+    assert requested_symbols.count("600000") == 1
+    assert requested_symbols.count("000001") == 2
+
+
+def test_successful_publish_removes_request_checkpoint(tmp_path):
+    make_pipeline(tmp_path).run(date(2025, 1, 6), full=True)
+
+    checkpoint = (
+        tmp_path
+        / "work"
+        / "market-data-checkpoints"
+        / "2024-12-31_2025-01-06"
+    )
+    assert not checkpoint.exists()
 
 
 def test_rerun_replaces_date_and_rebuilds_cumulative(tmp_path):
@@ -273,23 +330,23 @@ def test_publishes_immutable_version_and_switches_only_current_manifest(tmp_path
     make_pipeline(tmp_path).run(date(2025, 1, 6))
     manifest_path = tmp_path / "public/data/current.json"
     first_manifest = json.loads(manifest_path.read_text())
-    first_json = tmp_path / "public/data" / first_manifest["json"]
-    first_csv = tmp_path / "public/data" / first_manifest["csv"]
+    first_json = tmp_path / "public/data" / first_manifest["history_json"]
+    first_csv = tmp_path / "public/data" / first_manifest["history_csv"]
 
     make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(date(2025, 1, 6))
 
     second_manifest = json.loads(manifest_path.read_text())
     assert second_manifest["version"] != first_manifest["version"]
     assert first_json.exists() and first_csv.exists()
-    assert (tmp_path / "public/data" / second_manifest["json"]).exists()
-    assert (tmp_path / "public/data" / second_manifest["csv"]).exists()
+    assert (tmp_path / "public/data" / second_manifest["history_json"]).exists()
+    assert (tmp_path / "public/data" / second_manifest["history_csv"]).exists()
 
 
 def test_full_history_keeps_delisted_stock_until_its_delisting_date(tmp_path):
     make_pipeline(tmp_path, FixtureClient(include_delisted=True)).run(date(2025, 1, 8), full=True)
 
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
-    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["history_csv"])
 
     assert frame.loc[frame["date"] == "2025-01-06", "valid_count"].item() == 3
     assert frame.loc[frame["date"] == "2025-01-08", "valid_count"].item() == 2
@@ -301,7 +358,7 @@ def test_resumed_stock_uses_its_previous_valid_close_after_suspension(tmp_path):
     ).run(date(2025, 1, 7), full=True)
 
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
-    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["history_csv"])
 
     assert frame.loc[frame["date"] == "2025-01-07", "up_count"].item() == 1
     assert frame.loc[frame["date"] == "2025-01-07", "valid_count"].item() == 2
@@ -318,7 +375,7 @@ def test_resumed_stock_ignores_positive_stale_close_on_suspended_day(tmp_path):
     ).run(date(2025, 1, 7), full=True)
 
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
-    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["history_csv"])
 
     assert frame.loc[frame["date"] == "2025-01-07", "up_count"].item() == 2
     assert frame.loc[frame["date"] == "2025-01-07", "down_count"].item() == 0
@@ -328,7 +385,7 @@ def test_production_history_shape_marks_zero_turnover_stale_close_as_suspended(t
     make_pipeline(tmp_path, ProductionShapeFixtureClient()).run(date(2025, 1, 7), full=True)
 
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
-    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["history_csv"])
 
     assert frame.loc[frame["date"] == "2025-01-07", "up_count"].item() == 2
     assert frame.loc[frame["date"] == "2025-01-07", "down_count"].item() == 0
@@ -348,7 +405,7 @@ def test_first_published_index_change_uses_prior_trading_day_close(tmp_path):
     make_pipeline(tmp_path).run(date(2025, 1, 2))
 
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
-    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["history_csv"])
 
     assert frame.loc[0, "shanghai_change"] == 10.0
     assert frame.loc[0, "shanghai_change_pct"] == pytest.approx(0.3134796238244514)
