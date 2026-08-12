@@ -157,9 +157,12 @@ class AkshareClient:
                 "date": ("date", "日期"),
                 "symbol": ("symbol", "股票代码", "代码"),
                 "current_close": ("current_close", "收盘"),
+                "volume": ("volume", "成交量"),
+                "amount": ("amount", "成交额"),
             },
-            numeric_columns=("current_close",),
+            numeric_columns=("current_close", "volume", "amount"),
         )
+        result["is_suspended"] = result["volume"].eq(0) & result["amount"].eq(0)
         return result
 
     def _normalize_market(self, frame: pd.DataFrame, exchange: str) -> pd.DataFrame:

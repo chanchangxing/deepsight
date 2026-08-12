@@ -42,9 +42,11 @@ class FakeAkshareApi:
         self.history_request = kwargs
         return pd.DataFrame(
             {
-                "日期": ["2025-01-02"],
-                "股票代码": ["600000"],
-                "收盘": [10.5],
+                "日期": ["2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07"],
+                "股票代码": ["600000"] * 4,
+                "收盘": [10.0, 10.0, 10.0, 11.0],
+                "成交量": [100.0, 0.0, 0.0, 0.0],
+                "成交额": [1000.0, 0.0, 1000.0, None],
             }
         )
 
@@ -170,8 +172,12 @@ def test_get_stock_history_uses_unadjusted_daily_prices_and_normalizes_columns()
         "600000", "2025-01-01", "2025-01-03"
     )
 
-    assert result.to_dict("records") == [
-        {"date": "2025-01-02", "symbol": "600000", "current_close": 10.5}
+    assert result["is_suspended"].tolist() == [False, True, False, False]
+    assert result[["date", "symbol", "current_close", "volume"]].to_dict("records") == [
+        {"date": "2025-01-02", "symbol": "600000", "current_close": 10.0, "volume": 100.0},
+        {"date": "2025-01-03", "symbol": "600000", "current_close": 10.0, "volume": 0.0},
+        {"date": "2025-01-06", "symbol": "600000", "current_close": 10.0, "volume": 0.0},
+        {"date": "2025-01-07", "symbol": "600000", "current_close": 11.0, "volume": 0.0},
     ]
     assert api.history_request == {
         "symbol": "600000",

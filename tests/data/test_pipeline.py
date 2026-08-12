@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from scripts.market_data.akshare_client import AkshareClient
 from scripts.market_data.pipeline import (
     MarketDataPipeline,
     MarketDataValidationError,
@@ -124,6 +125,40 @@ class FixtureClient:
             }
         )
         return frame.loc[~((frame["symbol"].isin(self.omit_symbols)) & (frame["date"].isin(self.invalid_on)))].reset_index(drop=True)
+
+
+class HistoryShapeApi:
+    def __init__(self, fixture):
+        self.fixture = fixture
+
+    def stock_zh_a_hist(self, **kwargs):
+        symbol = kwargs["symbol"]
+        frame = FixtureClient.get_stock_history(
+            self.fixture, symbol, "2024-12-31", "2025-01-07"
+        )
+        result = frame.rename(
+            columns={"date": "日期", "symbol": "股票代码", "current_close": "收盘"}
+        ).loc[:, ["日期", "股票代码", "收盘"]]
+        result["成交量"] = 100.0
+        result["成交额"] = 1000.0
+        if symbol == "600000":
+            suspended = result["日期"] == "2025-01-06"
+            result.loc[suspended, "成交量"] = 0.0
+            result.loc[suspended, "成交额"] = 0.0
+        return result
+
+
+class ProductionShapeFixtureClient(FixtureClient):
+    def __init__(self):
+        super().__init__(
+            suspended_on="2025-01-06",
+            suspended_close=99.0,
+            close_overrides={("600000", "2025-01-07"): 12.0},
+        )
+        self.history_client = AkshareClient(api=HistoryShapeApi(self))
+
+    def get_stock_history(self, symbol, start, end):
+        return self.history_client.get_stock_history(symbol, start, end)
 
 
 def make_pipeline(tmp_path: Path, client=None) -> MarketDataPipeline:
@@ -281,6 +316,16 @@ def test_resumed_stock_ignores_positive_stale_close_on_suspended_day(tmp_path):
             close_overrides={("600000", "2025-01-07"): 12.0},
         ),
     ).run(date(2025, 1, 7), full=True)
+
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+
+    assert frame.loc[frame["date"] == "2025-01-07", "up_count"].item() == 2
+    assert frame.loc[frame["date"] == "2025-01-07", "down_count"].item() == 0
+
+
+def test_production_history_shape_marks_zero_turnover_stale_close_as_suspended(tmp_path):
+    make_pipeline(tmp_path, ProductionShapeFixtureClient()).run(date(2025, 1, 7), full=True)
 
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
     frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
