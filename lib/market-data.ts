@@ -97,6 +97,20 @@ const RANGE_MONTHS: Record<Exclude<MarketRange, "ALL">, number> = {
   "1Y": 12,
 };
 
+function subtractCalendarMonths(date: Date, months: number): Date {
+  const originalDay = date.getUTCDate();
+  const target = new Date(date);
+
+  target.setUTCDate(1);
+  target.setUTCMonth(target.getUTCMonth() - months);
+  const finalDay = new Date(
+    Date.UTC(target.getUTCFullYear(), target.getUTCMonth() + 1, 0),
+  ).getUTCDate();
+  target.setUTCDate(Math.min(originalDay, finalDay));
+
+  return target;
+}
+
 export function filterByRange(
   records: MarketRecord[],
   range: MarketRange,
@@ -104,8 +118,7 @@ export function filterByRange(
   if (range === "ALL" || records.length === 0) return records;
 
   const latest = new Date(`${records.at(-1)!.date}T00:00:00Z`);
-  const boundary = new Date(latest);
-  boundary.setUTCMonth(boundary.getUTCMonth() - RANGE_MONTHS[range]);
+  const boundary = subtractCalendarMonths(latest, RANGE_MONTHS[range]);
 
   return records.filter(
     ({ date }) => new Date(`${date}T00:00:00Z`) >= boundary,

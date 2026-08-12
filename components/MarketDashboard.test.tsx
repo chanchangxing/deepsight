@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MarketDashboard, MarketDashboardLoader } from "./MarketDashboard";
 import {
   filterByRange,
@@ -47,6 +47,14 @@ const records: MarketRecord[] = [
   },
 ];
 
+function recordAt(date: string): MarketRecord {
+  return { ...records[0], date };
+}
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe("market data", () => {
   it("rejects a history row with a missing numeric field", () => {
     expect(() =>
@@ -66,6 +74,19 @@ describe("market data", () => {
       "2024-03-01",
     ]);
     expect(filterByRange(records, "ALL")).toEqual(records);
+  });
+
+  it("clamps a one-month range to the target calendar month's last day", () => {
+    const monthEndRecords = [
+      recordAt("2025-02-27"),
+      recordAt("2025-02-28"),
+      recordAt("2025-03-03"),
+      recordAt("2025-03-31"),
+    ];
+
+    expect(
+      filterByRange(monthEndRecords, "1M").map(({ date }) => date),
+    ).toEqual(["2025-02-28", "2025-03-03", "2025-03-31"]);
   });
 });
 
@@ -97,7 +118,7 @@ describe("MarketDashboard", () => {
 
   it("loads the versioned history and CSV paths from the current manifest", async () => {
     const fetchCalls: string[] = [];
-    globalThis.fetch = (async (input: RequestInfo | URL) => {
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
       const url = String(input);
       fetchCalls.push(url);
 
@@ -112,7 +133,7 @@ describe("MarketDashboard", () => {
       }
 
       return new Response(JSON.stringify(records));
-    }) as typeof fetch;
+    });
 
     render(<MarketDashboardLoader />);
 
@@ -127,8 +148,36 @@ describe("MarketDashboard", () => {
     );
   });
 
+  it("shows a waiting state when published history loads successfully but is empty", async () => {
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+      if (String(input) === "/data/current.json") {
+        return new Response(
+          JSON.stringify({
+            version: "bootstrap",
+            history_json: "versions/bootstrap/market_history.json",
+            history_csv: "versions/bootstrap/market_history.csv",
+          }),
+        );
+      }
+
+      return new Response("[]");
+    });
+
+    render(<MarketDashboardLoader />);
+
+    expect(
+      await screen.findByRole("heading", { name: "暂无可展示数据" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/等待首次市场数据发布/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("数据连接异常")).not.toBeInTheDocument();
+  });
+
   it("shows a useful state when published data cannot be loaded", async () => {
-    globalThis.fetch = (async () => new Response("unavailable", { status: 503 })) as typeof fetch;
+    vi.stubGlobal(
+      "fetch",
+      async () => new Response("unavailable", { status: 503 }),
+    );
 
     render(<MarketDashboardLoader />);
 

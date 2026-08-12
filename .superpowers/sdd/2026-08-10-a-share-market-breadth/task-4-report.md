@@ -80,5 +80,46 @@ git diff --check
 ## Concerns
 
 1. 当前数据管道和 bootstrap 清单仍发布旧键 `json`/`csv`，而规范接口要求 `history_json`/`history_csv`。前端已以新键为主并兼容旧键，避免整合窗口内页面不可用；后续整合必须统一发布端及 Python 测试，届时可删除旧键兼容。
-2. bootstrap 历史 JSON 当前为空，因此直接使用仓库 bootstrap 数据时页面会显示明确的空数据状态；实际行情发布后才会呈现图表。
+2. bootstrap 历史 JSON 当前为空，因此直接使用仓库 bootstrap 数据时页面会显示“暂无可展示数据 / 等待首次市场数据发布”的非错误状态；实际行情发布后才会呈现图表。
 3. vinext 构建会输出其已知的路由静态分类提示以及 Node `punycode` 弃用警告，但构建成功，均非本任务代码错误。
+
+## Fix Round 1/5（审查修复）
+
+审查指出两个 Important 问题：月末直接调用 `setUTCMonth` 会向后溢出，以及成功载入空历史会被错误表达为连接异常。
+
+### RED
+
+先新增两个行为测试：
+
+- 最新日期为 `2025-03-31` 时，近 1 月必须包含夹到目标月末的 `2025-02-28`。
+- 清单和历史请求均成功但历史为 `[]` 时，必须显示等待首次发布的空状态，且不得出现 `alert` 或“数据连接异常”。
+
+运行目标测试后得到预期失败：
+
+```text
+Test Files 1 failed (1)
+Tests 2 failed | 6 passed (8)
+
+month-end: expected 2025-02-28 but received dates started at 2025-03-03
+empty state: unable to find heading "暂无可展示数据"; rendered role="alert"
+```
+
+### GREEN
+
+实现日历月回退辅助函数：先把日期设为目标月 1 日，再将原日期夹到目标月最后一天；空数组则渲染独立 `DashboardEmpty`，明确说明数据连接成功、等待首次发布。测试 fetch 改用 Vitest 全局桩并在每例后恢复。
+
+目标测试结果：
+
+```text
+Test Files 1 passed (1)
+Tests 8 passed (8)
+```
+
+本轮提交主题：`fix: handle month-end ranges and empty data`。
+
+### 暂缓 Minor
+
+- 清单 URL 的同源、版本目录和文件扩展名约束。
+- 对不存在公历日期的严格回比，以及避免解析排序对调用方数组的原地修改。
+- 980px 两列指标卡边框选择器调整。
+- 旧发布键 `json/csv` 的独立兼容测试（生产兼容分支仍保留）。

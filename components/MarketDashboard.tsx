@@ -48,7 +48,7 @@ export function MarketDashboard({
   const latest = records.at(-1);
 
   if (!latest) {
-    return <DashboardError message="已发布的数据中暂时没有交易记录。" />;
+    return <DashboardEmpty />;
   }
 
   return (
@@ -157,6 +157,18 @@ function DashboardError({ message }: { message: string }) {
         <p>{message}</p>
         <button type="button" onClick={() => window.location.reload()}>重新载入</button>
       </div>
+    </main>
+  );
+}
+
+function DashboardEmpty() {
+  return (
+    <main className="state-shell">
+      <section className="state-card" aria-labelledby="empty-state-title">
+        <p className="eyebrow">数据已连接</p>
+        <h1 id="empty-state-title">暂无可展示数据</h1>
+        <p>清单与历史数据已成功载入，正在等待首次市场数据发布。</p>
+      </section>
     </main>
   );
 }
