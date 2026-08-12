@@ -24,6 +24,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Restore market data checkpoints
+        id: checkpoint_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: work/market-data-checkpoints
+          key: market-data-checkpoints-v2-akshare-unadjusted-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            market-data-checkpoints-v2-akshare-unadjusted-${{ runner.os }}-
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -38,6 +47,13 @@ jobs:
           else
             python scripts/update_market_data.py
           fi
+
+      - name: Save market data checkpoints
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: work/market-data-checkpoints
+          key: ${{ steps.checkpoint_cache.outputs.cache-primary-key }}
 
       - name: Validate published data
         run: python -m pytest tests/data -v

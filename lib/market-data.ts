@@ -17,7 +17,11 @@ export type MarketManifest = {
   version: string;
   history_json: string;
   history_csv: string;
+  generated_at: string | null;
 };
+
+const RFC_3339_INSTANT =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
 
 const NUMERIC_FIELDS: (keyof Omit<MarketRecord, "date">)[] = [
   "shanghai_close",
@@ -43,6 +47,17 @@ export function parseMarketManifest(input: unknown): MarketManifest {
   const manifest = input as Record<string, unknown>;
   const historyJson = manifest.history_json ?? manifest.json;
   const historyCsv = manifest.history_csv ?? manifest.csv;
+  const generatedAt = manifest.generated_at ?? manifest.updated_at;
+
+  if (
+    manifest.generated_at !== undefined &&
+    manifest.updated_at !== undefined &&
+    (typeof manifest.generated_at !== "string" ||
+      typeof manifest.updated_at !== "string" ||
+      Date.parse(manifest.generated_at) !== Date.parse(manifest.updated_at))
+  ) {
+    throw new Error("数据清单的 generated_at 与 updated_at 时间字段冲突");
+  }
 
   if (
     typeof manifest.version !== "string" ||
@@ -52,10 +67,28 @@ export function parseMarketManifest(input: unknown): MarketManifest {
     throw new Error("数据清单缺少版本或文件路径");
   }
 
+  if (manifest.version !== "bootstrap") {
+    if (
+      typeof generatedAt !== "string" ||
+      !RFC_3339_INSTANT.test(generatedAt) ||
+      !Number.isFinite(Date.parse(generatedAt))
+    ) {
+      throw new Error("数据清单缺少有效的 generated_at 时间");
+    }
+  } else if (
+    generatedAt !== undefined &&
+    (typeof generatedAt !== "string" ||
+      !RFC_3339_INSTANT.test(generatedAt) ||
+      !Number.isFinite(Date.parse(generatedAt)))
+  ) {
+    throw new Error("数据清单的 generated_at 时间无效");
+  }
+
   return {
     version: manifest.version,
     history_json: asDataPath(historyJson),
     history_csv: asDataPath(historyCsv),
+    generated_at: typeof generatedAt === "string" ? generatedAt : null,
   };
 }
 

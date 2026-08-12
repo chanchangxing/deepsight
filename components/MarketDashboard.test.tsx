@@ -5,6 +5,7 @@ import { MarketDashboard, MarketDashboardLoader } from "./MarketDashboard";
 import {
   filterByRange,
   parseMarketHistory,
+  parseMarketManifest,
   type MarketRecord,
 } from "@/lib/market-data";
 
@@ -56,6 +57,73 @@ afterEach(() => {
 });
 
 describe("market data", () => {
+  it("parses generated_at and the updated_at migration alias", () => {
+    expect(
+      parseMarketManifest({
+        version: "20250808T091000Z",
+        history_json: "versions/20250808T091000Z/market_history.json",
+        history_csv: "versions/20250808T091000Z/market_history.csv",
+        generated_at: "2025-08-08T09:10:00Z",
+      }),
+    ).toEqual({
+      version: "20250808T091000Z",
+      history_json: "/data/versions/20250808T091000Z/market_history.json",
+      history_csv: "/data/versions/20250808T091000Z/market_history.csv",
+      generated_at: "2025-08-08T09:10:00Z",
+    });
+
+    expect(
+      parseMarketManifest({
+        version: "20250808T091000Z",
+        history_json: "versions/20250808T091000Z/market_history.json",
+        history_csv: "versions/20250808T091000Z/market_history.csv",
+        updated_at: "2025-08-08T17:10:00+08:00",
+      }).generated_at,
+    ).toBe("2025-08-08T17:10:00+08:00");
+  });
+
+  it("rejects a published manifest without a valid RFC 3339 timestamp", () => {
+    const manifest = {
+      version: "20250808T091000Z",
+      history_json: "versions/20250808T091000Z/market_history.json",
+      history_csv: "versions/20250808T091000Z/market_history.csv",
+    };
+
+    expect(() => parseMarketManifest(manifest)).toThrow(/generated_at/);
+    expect(() =>
+      parseMarketManifest({ ...manifest, generated_at: "2025-08-08" }),
+    ).toThrow(/generated_at/);
+    expect(
+      parseMarketManifest({
+        ...manifest,
+        generated_at: "2025-08-08T09:10:00Z",
+        updated_at: "2025-08-08T17:10:00+08:00",
+      }).generated_at,
+    ).toBe("2025-08-08T09:10:00Z");
+    expect(() =>
+      parseMarketManifest({
+        ...manifest,
+        generated_at: "2025-08-08T09:10:00Z",
+        updated_at: "2025-08-08T17:11:00+08:00",
+      }),
+    ).toThrow(/时间字段冲突/);
+  });
+
+  it("keeps the timestamp-less bootstrap manifest readable", () => {
+    expect(
+      parseMarketManifest({
+        version: "bootstrap",
+        json: "versions/bootstrap/market_history.json",
+        csv: "versions/bootstrap/market_history.csv",
+      }),
+    ).toEqual({
+      version: "bootstrap",
+      history_json: "/data/versions/bootstrap/market_history.json",
+      history_csv: "/data/versions/bootstrap/market_history.csv",
+      generated_at: null,
+    });
+  });
+
   it("rejects a history row with a missing numeric field", () => {
     expect(() =>
       parseMarketHistory([{ ...records[0], valid_count: undefined }]),
@@ -97,12 +165,16 @@ describe("MarketDashboard", () => {
       <MarketDashboard
         records={records}
         csvHref="/data/versions/test/market_history.csv"
+        generatedAt="2024-03-01T09:10:00Z"
+        now={new Date("2024-03-01T10:00:00Z")}
       />,
     );
 
     expect(screen.getAllByText("累计涨跌差值").length).toBeGreaterThan(0);
     expect(screen.getByText("+15")).toBeInTheDocument();
     expect(screen.getByText(/数据截至 2024年3月1日/)).toBeInTheDocument();
+    expect(screen.getByText(/最近成功更新：2024年3月1日 17:10/)).toBeInTheDocument();
+    expect(screen.getByText("数据更新正常")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: /下载 CSV/ })).toHaveAttribute(
       "href",
       "/data/versions/test/market_history.csv",
@@ -114,6 +186,75 @@ describe("MarketDashboard", () => {
       "true",
     );
     expect(screen.getByText("2 个交易日")).toBeInTheDocument();
+  });
+
+  it("warns clearly when the last successful publication missed a Beijing close deadline", () => {
+    render(
+      <MarketDashboard
+        records={records}
+        csvHref="/data/versions/test/market_history.csv"
+        generatedAt="2024-03-01T09:10:00Z"
+        now={new Date("2024-03-04T10:00:00Z")}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("数据可能已过期");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "最近成功更新：2024年3月1日 17:10",
+    );
+  });
+
+  it("does not mark Friday's publication stale before Monday's Beijing deadline", () => {
+    render(
+      <MarketDashboard
+        records={records}
+        csvHref="/data/versions/test/market_history.csv"
+        generatedAt="2024-03-01T09:10:00Z"
+        now={new Date("2024-03-04T09:59:00Z")}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("数据更新正常");
+    expect(screen.queryByText("数据可能已过期")).not.toBeInTheDocument();
+  });
+
+  it("expires a pre-close generation at the same Beijing weekday deadline", () => {
+    render(
+      <MarketDashboard
+        records={[...records, recordAt("2024-03-04")]}
+        csvHref="/data/versions/test/market_history.csv"
+        generatedAt="2024-03-04T06:00:00Z"
+        now={new Date("2024-03-04T10:00:00Z")}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("数据可能已过期");
+  });
+
+  it("warns when a recent manifest points to history behind the latest weekday deadline", () => {
+    render(
+      <MarketDashboard
+        records={records}
+        csvHref="/data/versions/test/market_history.csv"
+        generatedAt="2024-03-04T10:10:00Z"
+        now={new Date("2024-03-04T10:20:00Z")}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("数据可能已过期");
+  });
+
+  it("keeps Friday history fresh throughout the weekend", () => {
+    render(
+      <MarketDashboard
+        records={records}
+        csvHref="/data/versions/test/market_history.csv"
+        generatedAt="2024-03-01T10:10:00Z"
+        now={new Date("2024-03-03T12:00:00Z")}
+      />,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("数据更新正常");
   });
 
   it("loads the versioned history and CSV paths from the current manifest", async () => {
@@ -128,6 +269,7 @@ describe("MarketDashboard", () => {
             version: "test",
             history_json: "versions/test/market_history.json",
             history_csv: "versions/test/market_history.csv",
+            generated_at: "2024-03-01T09:10:00Z",
           }),
         );
       }
@@ -135,7 +277,7 @@ describe("MarketDashboard", () => {
       return new Response(JSON.stringify(records));
     });
 
-    render(<MarketDashboardLoader />);
+    render(<MarketDashboardLoader now={new Date("2024-03-01T10:00:00Z")} />);
 
     expect((await screen.findAllByText("累计涨跌差值")).length).toBeGreaterThan(0);
     expect(fetchCalls).toEqual([
@@ -146,6 +288,7 @@ describe("MarketDashboard", () => {
       "href",
       "/data/versions/test/market_history.csv",
     );
+    expect(screen.getByRole("status")).toHaveTextContent("数据更新正常");
   });
 
   it("shows a waiting state when published history loads successfully but is empty", async () => {

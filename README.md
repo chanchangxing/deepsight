@@ -35,8 +35,15 @@ command and error output before retrying.
 
 Published files are immutable under `public/data/versions/<uuid>/`. The
 `public/data/current.json` manifest is the version pointer consumed by the site;
-it changes only after a new version has been fully written. Do not treat a fixed
-`data/` CSV as the source of the live release.
+it changes only after a new version has been fully written. The canonical
+`data/market_history.csv` is updated in the same transaction as the immutable
+version and kept byte-for-byte identical for repository review; the manifest
+remains the site's live release pointer.
+
+Private per-symbol checkpoints live below `work/market-data-checkpoints/` and
+are restored by GitHub Actions across runs. They are namespaced by source and
+data semantics, validated before reuse, and retained after successful releases
+so a later `as_of` date fetches only the uncovered tail.
 
 To recover historical data, open **Actions → Update market breadth data → Run
 workflow**, tick **full**, and run it. This rebuilds history from 2025-01-01.

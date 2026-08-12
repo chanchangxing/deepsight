@@ -19,6 +19,9 @@ const ranges: Array<{ value: MarketRange; label: string }> = [
 ];
 
 const integerFormatter = new Intl.NumberFormat("zh-CN");
+const BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000;
+const MARKET_CLOSE_HOUR = 15;
+const PUBLICATION_DEADLINE_HOUR = 18;
 
 function formatDate(date: string) {
   return new Intl.DateTimeFormat("zh-CN", {
@@ -29,6 +32,67 @@ function formatDate(date: string) {
   }).format(new Date(`${date}T00:00:00Z`));
 }
 
+function formatGeneratedAt(generatedAt: string) {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(generatedAt));
+  const value = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value;
+
+  return `${value("year")}年${value("month")}月${value("day")}日 ${value("hour")}:${value("minute")}`;
+}
+
+function nextPublicationDeadline(generatedAt: string): Date {
+  const generatedBeijing = new Date(
+    new Date(generatedAt).getTime() + BEIJING_OFFSET_MS,
+  );
+  const generatedBeforeMarketClose =
+    generatedBeijing.getUTCHours() < MARKET_CLOSE_HOUR;
+  const deadline = new Date(
+    Date.UTC(
+      generatedBeijing.getUTCFullYear(),
+      generatedBeijing.getUTCMonth(),
+      generatedBeijing.getUTCDate() + (generatedBeforeMarketClose ? 0 : 1),
+      PUBLICATION_DEADLINE_HOUR - 8,
+    ),
+  );
+
+  while (new Date(deadline.getTime() + BEIJING_OFFSET_MS).getUTCDay() % 6 === 0) {
+    deadline.setUTCDate(deadline.getUTCDate() + 1);
+  }
+
+  return deadline;
+}
+
+function expectedRecordDate(now: Date): string | null {
+  const nowBeijing = new Date(now.getTime() + BEIJING_OFFSET_MS);
+  if (nowBeijing.getUTCHours() < PUBLICATION_DEADLINE_HOUR) return null;
+
+  while (nowBeijing.getUTCDay() % 6 === 0) {
+    nowBeijing.setUTCDate(nowBeijing.getUTCDate() - 1);
+  }
+
+  return nowBeijing.toISOString().slice(0, 10);
+}
+
+function isMarketDataStale(
+  generatedAt: string,
+  latestRecordDate: string,
+  now: Date,
+) {
+  const expectedDate = expectedRecordDate(now);
+  return (
+    now >= nextPublicationDeadline(generatedAt) ||
+    (expectedDate !== null && latestRecordDate < expectedDate)
+  );
+}
+
 function metricTone(value: number) {
   return value > 0 ? "metric-up" : value < 0 ? "metric-down" : "";
 }
@@ -36,9 +100,13 @@ function metricTone(value: number) {
 export function MarketDashboard({
   records,
   csvHref,
+  generatedAt,
+  now = new Date(),
 }: {
   records: MarketRecord[];
   csvHref: string;
+  generatedAt: string;
+  now?: Date;
 }) {
   const [range, setRange] = useState<MarketRange>("ALL");
   const filteredRecords = useMemo(
@@ -51,6 +119,8 @@ export function MarketDashboard({
     return <DashboardEmpty />;
   }
 
+  const stale = isMarketDataStale(generatedAt, latest.date, now);
+
   return (
     <main>
       <header className="site-header">
@@ -58,9 +128,12 @@ export function MarketDashboard({
           <span className="brand-mark" aria-hidden="true">D/N</span>
           <span>沪深市场广度</span>
         </a>
-        <div className="header-meta">
+        <div className={`header-meta ${stale ? "is-stale" : ""}`} role="status">
           <span className="status-dot" aria-hidden="true" />
-          数据截至 {formatDate(latest.date)}
+          <span>
+            <strong>{stale ? "数据可能已过期" : "数据更新正常"}</strong>
+            数据截至 {formatDate(latest.date)} · 最近成功更新：{formatGeneratedAt(generatedAt)}
+          </span>
         </div>
       </header>
 
@@ -173,10 +246,15 @@ function DashboardEmpty() {
   );
 }
 
-export function MarketDashboardLoader() {
+export function MarketDashboardLoader({ now }: { now?: Date } = {}) {
   const [state, setState] = useState<
     | { status: "loading" }
-    | { status: "ready"; records: MarketRecord[]; csvHref: string }
+    | {
+        status: "ready";
+        records: MarketRecord[];
+        csvHref: string;
+        generatedAt: string | null;
+      }
     | { status: "error"; message: string }
   >({ status: "loading" });
 
@@ -198,7 +276,12 @@ export function MarketDashboardLoader() {
         const records = parseMarketHistory(await historyResponse.json());
 
         if (!cancelled) {
-          setState({ status: "ready", records, csvHref: manifest.history_csv });
+          setState({
+            status: "ready",
+            records,
+            csvHref: manifest.history_csv,
+            generatedAt: manifest.generated_at,
+          });
         }
       } catch (error) {
         if (!cancelled) {
@@ -228,5 +311,13 @@ export function MarketDashboardLoader() {
   }
 
   if (state.status === "error") return <DashboardError message={state.message} />;
-  return <MarketDashboard records={state.records} csvHref={state.csvHref} />;
+  if (!state.generatedAt) return <DashboardEmpty />;
+  return (
+    <MarketDashboard
+      records={state.records}
+      csvHref={state.csvHref}
+      generatedAt={state.generatedAt}
+      now={now}
+    />
+  );
 }

@@ -4,16 +4,16 @@
 
 **Goal:** Make full AKShare history collection resume after interruption without publishing partial data.
 
-**Architecture:** `MarketDataPipeline` stores one validated CSV checkpoint per symbol under an ignored request-range directory. Reads validate the cached schema, writes are atomic, and only a successful publish removes that exact checkpoint directory.
+**Architecture:** `MarketDataPipeline` stores validated, end-dated CSV checkpoints per symbol under an ignored, source-versioned namespace. Reads validate the cached schema and coverage, writes are atomic, and later runs extend only the uncovered tail.
 
 **Tech Stack:** Python 3.9+, pandas, pytest, filesystem atomic replace.
 
 ## Global Constraints
 
-- Checkpoints live only below `work/market-data-checkpoints/<start>_<end>/`.
+- Checkpoints live only below `work/market-data-checkpoints/v2-akshare-unadjusted/<baseline>/<symbol>/`.
 - Partial histories must never be copied into `data/` or `public/data/`.
 - Existing canonical manifest keys are `history_json` and `history_csv`; old keys remain read-compatible only.
-- A successful publish clears the request-range checkpoint directory; failures preserve completed symbols.
+- Successful and failed runs preserve valid completed-symbol checkpoints for reuse.
 
 ---
 
@@ -47,31 +47,31 @@ Run: `python3 -m pytest tests/data/test_pipeline.py::test_full_run_resumes_compl
 
 Expected: PASS.
 
-### Task 2: Clear checkpoints after successful publication
+### Task 2: Reuse checkpoints across later publication dates
 
 **Files:**
 - Modify: `scripts/market_data/pipeline.py`
 - Test: `tests/data/test_pipeline.py`
 
 **Interfaces:**
-- Consumes: the request-range checkpoint directory created in Task 1.
-- Produces: successful `run(...)` with no remaining exact-range checkpoint directory.
+- Consumes: the source-versioned per-symbol checkpoints created in Task 1.
+- Produces: successful `run(...)` that retains checkpoints and fetches only an uncovered tail on a later `as_of` date.
 
-- [ ] **Step 1: Write a failing cleanup test**
+- [ ] **Step 1: Write a failing incremental-reuse test**
 
-Run a full fixture update and assert `work/market-data-checkpoints/2024-12-31_2025-01-06` does not exist after publication.
+Run a full fixture update, advance `as_of`, and assert the next stock request begins one day after the prior checkpoint's covered end.
 
-- [ ] **Step 2: Verify the test fails because checkpoints remain**
+- [ ] **Step 2: Verify the test fails because the old range cache cannot extend**
 
-Run: `python3 -m pytest tests/data/test_pipeline.py::test_successful_publish_removes_request_checkpoint -v`
+Run: `python3 -m pytest tests/data/test_pipeline.py::test_successful_publish_keeps_checkpoint_for_later_as_of -v`
 
-Expected: FAIL because the checkpoint directory still exists.
+Expected: FAIL because the old implementation refetches the full range.
 
-- [ ] **Step 3: Implement exact-range cleanup after `_atomic_publish`**
+- [ ] **Step 3: Implement source-versioned coverage checkpoints**
 
-Use `shutil.rmtree(checkpoint_dir)` only after the active manifest has switched successfully. Do not clean during exceptions.
+Select the newest valid checkpoint, fetch only the uncovered tail, merge and validate it, then atomically write the new end-dated checkpoint. Retain it after publication.
 
-- [ ] **Step 4: Verify cleanup and all data tests**
+- [ ] **Step 4: Verify incremental reuse and all data tests**
 
 Run: `python3 -m pytest tests/data -v`
 

@@ -8,6 +8,7 @@
   --line: #d7dcd9;
   --red: #c83b35;
   --green: #16825d;
+  --amber: #a45d00;
   --navy: #20364f;
 }
 
@@ -51,8 +52,12 @@ footer {
 
 .brand { display: inline-flex; align-items: center; gap: 12px; font-weight: 670; text-decoration: none; }
 .brand-mark { display: grid; place-items: center; width: 38px; height: 38px; color: #fff; background: var(--navy); border-radius: 4px; font: 650 12px var(--font-geist-mono), monospace; letter-spacing: -.05em; }
-.header-meta { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 13px; }
+.header-meta { min-width: 0; display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; line-height: 1.45; text-align: right; }
+.header-meta > span:last-child { display: grid; }
+.header-meta strong { color: var(--green); font-size: 13px; font-weight: 650; }
 .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(22,130,93,.1); }
+.header-meta.is-stale strong { color: var(--amber); }
+.header-meta.is-stale .status-dot { background: var(--amber); box-shadow: 0 0 0 4px rgba(164,93,0,.12); }
 
 .hero { padding: 64px 0 42px; display: flex; align-items: end; justify-content: space-between; gap: 32px; }
 .hero-copy { max-width: 760px; }
@@ -123,7 +128,7 @@ footer { display: flex; justify-content: space-between; padding: 24px 0 36px; bo
 
 @media (max-width: 680px) {
   .site-header, .hero, .metrics, .dashboard-frame, .methodology, footer { width: min(100% - 28px, 1240px); }
-  .site-header { height: 64px; }
+  .site-header { min-height: 64px; height: auto; padding-block: 10px; gap: 14px; }
   .brand { gap: 9px; font-size: 14px; }
   .brand-mark { width: 32px; height: 32px; }
   .header-meta { font-size: 11px; }

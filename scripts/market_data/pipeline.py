@@ -5,13 +5,12 @@ from __future__ import annotations
 import io
 import json
 import os
-import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -21,6 +20,8 @@ from .calculations import add_cumulative_diff, calculate_index_changes, classify
 
 HISTORY_START = date(2025, 1, 1)
 INDEX_LOOKBACK_DAYS = 31
+STOCK_HISTORY_START = date(1990, 12, 1)
+CHECKPOINT_NAMESPACE = "v2-akshare-unadjusted"
 RECENT_VALID_COUNT_DAYS = 5
 MIN_VALID_COUNT_RATIO = 0.60
 MAX_MISSING_PRICE_OR_COMPARISON_RATIO = 0.20
@@ -89,9 +90,15 @@ def validate_history(frame: pd.DataFrame) -> None:
 class MarketDataPipeline:
     """Build and publish market history only after the complete result validates."""
 
-    def __init__(self, root: Path | str | None = None, client: Any | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | str | None = None,
+        client: Any | None = None,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         self.root = Path(root) if root is not None else Path(__file__).resolve().parents[2]
         self.client = client if client is not None else AkshareClient()
+        self.now = now if now is not None else lambda: datetime.now(timezone.utc)
         self.csv_path = self.root / "data" / "market_history.csv"
         self.public_data_path = self.root / "public" / "data"
         self.manifest_path = self.public_data_path / "current.json"
@@ -116,6 +123,16 @@ class MarketDataPipeline:
 
         existing_dates = set(existing["date"])
         missing_dates = [value for value in index_dates if value not in existing_dates]
+        latest_index_date = index_dates[-1]
+        as_of_is_trading_day = latest_index_date == as_of.isoformat()
+        if (
+            not full
+            and not missing_dates
+            and not existing.empty
+            and existing["date"].iloc[-1] == latest_index_date
+            and (as_of_is_trading_day or as_of > date.fromisoformat(latest_index_date))
+        ):
+            return UpdateResult((), skipped=True)
         recent_dates = index_dates if full else index_dates[-5:]
         dates_to_update = [
             value for value in index_dates if value in set(missing_dates).union(recent_dates)
@@ -129,11 +146,9 @@ class MarketDataPipeline:
         combined = combined.loc[:, REQUIRED_COLUMNS].sort_values("date").reset_index(drop=True)
         combined = add_cumulative_diff(combined).loc[:, REQUIRED_COLUMNS]
         validate_history(combined)
+        if self._history_csv_bytes(combined) == self._history_csv_bytes(existing):
+            return UpdateResult((), skipped=True)
         self._atomic_publish(combined)
-        checkpoint_directory = self._checkpoint_directory(
-            (HISTORY_START - timedelta(days=1)).isoformat(), as_of.isoformat()
-        )
-        shutil.rmtree(checkpoint_directory, ignore_errors=True)
         return UpdateResult(tuple(dates_to_update))
 
     def _read_history(self) -> pd.DataFrame:
@@ -199,7 +214,7 @@ class MarketDataPipeline:
             | (market["delisting_date"] >= HISTORY_START.isoformat())
         ].reset_index(drop=True)
 
-        history_start = (HISTORY_START - timedelta(days=1)).isoformat()
+        history_start = STOCK_HISTORY_START.isoformat()
         histories = []
         for symbol in market["symbol"]:
             history = self._stock_history(
@@ -268,7 +283,7 @@ class MarketDataPipeline:
                 raise MarketDataValidationError(f"no valid stock prices for {value}")
             active_by_exchange = active_market.groupby("exchange").size()
             valid_by_exchange = daily_prices.loc[
-                daily_prices["current_close"].gt(0) & daily_prices["previous_close"].gt(0)
+                self._valid_price_mask(daily_prices)
             ].groupby("exchange").size()
             required_exchanges = {
                 exchange
@@ -295,33 +310,53 @@ class MarketDataPipeline:
         return pd.DataFrame(records, columns=REQUIRED_COLUMNS)
 
     def _stock_history(self, symbol: str, start: str, end: str) -> pd.DataFrame:
-        checkpoint_path = self._checkpoint_directory(start, end) / f"{symbol}.csv"
-        if checkpoint_path.exists():
+        checkpoint_directory = self._checkpoint_directory(start, end) / symbol
+        cached = None
+        cached_end = None
+        for candidate in sorted(checkpoint_directory.glob("*.csv"), reverse=True):
             try:
+                coverage_end = date.fromisoformat(candidate.stem).isoformat()
                 checkpoint = pd.read_csv(
-                    checkpoint_path,
+                    candidate,
                     dtype={"date": str, "symbol": str},
                 )
-                if not {
-                    "date",
-                    "symbol",
-                    "current_close",
-                    "is_suspended",
-                }.issubset(checkpoint.columns):
-                    raise ValueError("checkpoint schema is incomplete")
-                if not checkpoint["symbol"].astype(str).str.zfill(6).eq(symbol).all():
-                    raise ValueError("checkpoint symbol does not match")
-                return checkpoint
+                cached = self._validated_stock_history(
+                    checkpoint, symbol, start, coverage_end
+                )
+                cached_end = coverage_end
+                break
             except (OSError, ValueError, pd.errors.ParserError):
-                pass
+                candidate.unlink(missing_ok=True)
 
-        history = self.client.get_stock_history(symbol, start, end).copy()
-        if not {"date", "current_close", "is_suspended"}.issubset(history.columns):
-            raise MarketDataValidationError(f"stock history is incomplete for {symbol}")
+        if cached is not None and cached_end is not None and cached_end >= end:
+            return cached.loc[cached["date"].between(start, end)].reset_index(drop=True)
+
+        request_start = start
+        if cached_end is not None:
+            request_start = (date.fromisoformat(cached_end) + timedelta(days=1)).isoformat()
+
+        history = self.client.get_stock_history(symbol, request_start, end).copy()
         history["symbol"] = symbol
-        checkpoint = history.loc[
-            :, ["date", "symbol", "current_close", "is_suspended"]
-        ]
+        try:
+            normalized_history_dates = pd.to_datetime(
+                history["date"], errors="raise"
+            ).dt.strftime("%Y-%m-%d")
+        except (KeyError, TypeError, ValueError) as error:
+            raise MarketDataValidationError(
+                f"stock history is incomplete for {symbol}"
+            ) from error
+        history = history.loc[
+            normalized_history_dates.between(request_start, end)
+        ].copy()
+        history["date"] = normalized_history_dates.loc[history.index]
+        extension = self._validated_stock_history(history, symbol, request_start, end)
+        checkpoint = (
+            extension
+            if cached is None
+            else pd.concat([cached, extension], ignore_index=True)
+        )
+        checkpoint = self._validated_stock_history(checkpoint, symbol, start, end)
+        checkpoint_path = checkpoint_directory / f"{end}.csv"
         payload = checkpoint.to_csv(index=False).encode("utf-8")
         checkpoint_temp = self._write_temp(checkpoint_path, payload)
         try:
@@ -329,10 +364,54 @@ class MarketDataPipeline:
             self._fsync_directory(checkpoint_path.parent)
         finally:
             checkpoint_temp.unlink(missing_ok=True)
-        return checkpoint
+        for superseded in checkpoint_directory.glob("*.csv"):
+            if superseded != checkpoint_path:
+                superseded.unlink(missing_ok=True)
+        return checkpoint.loc[checkpoint["date"].between(start, end)].reset_index(drop=True)
+
+    @staticmethod
+    def _validated_stock_history(
+        frame: pd.DataFrame, symbol: str, start: str, end: str
+    ) -> pd.DataFrame:
+        required = {"date", "symbol", "current_close", "is_suspended"}
+        if not required.issubset(frame.columns):
+            raise ValueError("checkpoint schema is incomplete")
+        result = frame.loc[
+            :, ["date", "symbol", "current_close", "is_suspended"]
+        ].copy()
+        try:
+            result["date"] = pd.to_datetime(result["date"], errors="raise").dt.strftime(
+                "%Y-%m-%d"
+            )
+            result["current_close"] = pd.to_numeric(
+                result["current_close"], errors="raise"
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("checkpoint values are invalid") from error
+        if not result["symbol"].astype(str).str.zfill(6).eq(symbol).all():
+            raise ValueError("checkpoint symbol does not match")
+        suspended_values = result["is_suspended"]
+        if not pd.api.types.is_bool_dtype(suspended_values):
+            normalized = suspended_values.astype(str).str.lower().map(
+                {"true": True, "false": False}
+            )
+            if normalized.isna().any():
+                raise ValueError("checkpoint suspension flag is invalid")
+            result["is_suspended"] = normalized.astype(bool)
+        if not result["date"].between(start, end).all():
+            raise ValueError("checkpoint dates fall outside its coverage")
+        if result["date"].duplicated().any():
+            raise ValueError("checkpoint contains duplicate dates")
+        return result.sort_values("date").reset_index(drop=True)
 
     def _checkpoint_directory(self, start: str, end: str) -> Path:
-        return self.root / "work" / "market-data-checkpoints" / f"{start}_{end}"
+        return (
+            self.root
+            / "work"
+            / "market-data-checkpoints"
+            / CHECKPOINT_NAMESPACE
+            / start
+        )
 
     def _validate_daily_quality(
         self,
@@ -343,19 +422,18 @@ class MarketDataPipeline:
     ) -> None:
         if universe.empty:
             raise MarketDataValidationError(f"empty historical security universe for {value}")
-        expected = len(universe)
-        available = prices["current_close"].gt(0)
-        comparable = available & prices["previous_close"].gt(0)
         suspended = prices.get("is_suspended", pd.Series(False, index=prices.index)).fillna(False)
+        comparable = self._valid_price_mask(prices)
         quality_expected = int((~suspended).sum())
         missing_ratio = 1 - (int(comparable.sum()) / quality_expected) if quality_expected else 0
         prior = existing.loc[existing["date"] < value, "valid_count"].tail(
             RECENT_VALID_COUNT_DAYS
         )
+        suspended_count = int(suspended.sum())
+        baseline_valid = int(comparable.sum()) + suspended_count
         if (
             not prior.empty
-            and not suspended.any()
-            and int(comparable.sum()) < prior.median() * MIN_VALID_COUNT_RATIO
+            and baseline_valid < prior.median() * MIN_VALID_COUNT_RATIO
         ):
             raise MarketDataValidationError(f"valid stock count dropped for {value}")
         if missing_ratio > MAX_MISSING_PRICE_OR_COMPARISON_RATIO:
@@ -364,8 +442,19 @@ class MarketDataPipeline:
                 f"{MAX_MISSING_PRICE_OR_COMPARISON_RATIO:.1%} for {value}"
             )
 
+    @staticmethod
+    def _valid_price_mask(prices: pd.DataFrame) -> pd.Series:
+        suspended = prices.get(
+            "is_suspended", pd.Series(False, index=prices.index)
+        ).fillna(False)
+        return (
+            prices["current_close"].gt(0)
+            & prices["previous_close"].gt(0)
+            & ~suspended
+        )
+
     def _atomic_publish(self, frame: pd.DataFrame) -> None:
-        csv_bytes = frame.to_csv(index=False).encode("utf-8")
+        csv_bytes = self._history_csv_bytes(frame)
         csv_frame = pd.read_csv(io.BytesIO(csv_bytes), dtype={"date": str})
         json_bytes = json.dumps(
             csv_frame.to_dict(orient="records"), ensure_ascii=False, separators=(",", ":")
@@ -377,14 +466,24 @@ class MarketDataPipeline:
         json_path = version_path / "market_history.json"
         csv_temp = self._write_temp(csv_path, csv_bytes)
         json_temp = self._write_temp(json_path, json_bytes)
+        canonical_temp = self._write_temp(self.csv_path, csv_bytes)
+        previous_canonical = (
+            self.csv_path.read_bytes() if self.csv_path.exists() else None
+        )
+        canonical_switched = False
         try:
             os.replace(csv_temp, csv_path)
             os.replace(json_temp, json_path)
             self._fsync_directory(version_path)
+            os.replace(canonical_temp, self.csv_path)
+            canonical_switched = True
+            self._fsync_directory(self.csv_path.parent)
+            generated_at = self.now().astimezone(timezone.utc).replace(microsecond=0)
             manifest = {
                 "version": version,
                 "history_csv": f"versions/{version}/market_history.csv",
                 "history_json": f"versions/{version}/market_history.json",
+                "generated_at": generated_at.isoformat().replace("+00:00", "Z"),
             }
             manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
             manifest_temp = self._write_temp(self.manifest_path, manifest_bytes)
@@ -393,9 +492,30 @@ class MarketDataPipeline:
                 self._fsync_directory(self.public_data_path)
             finally:
                 manifest_temp.unlink(missing_ok=True)
+        except Exception:
+            if canonical_switched:
+                if previous_canonical is None:
+                    self.csv_path.unlink(missing_ok=True)
+                else:
+                    rollback_temp = self._write_temp(
+                        self.csv_path, previous_canonical
+                    )
+                    try:
+                        os.replace(rollback_temp, self.csv_path)
+                        self._fsync_directory(self.csv_path.parent)
+                    finally:
+                        rollback_temp.unlink(missing_ok=True)
+            raise
         finally:
             csv_temp.unlink(missing_ok=True)
             json_temp.unlink(missing_ok=True)
+            canonical_temp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _history_csv_bytes(frame: pd.DataFrame) -> bytes:
+        return frame.loc[:, REQUIRED_COLUMNS].to_csv(
+            index=False, float_format="%.12g", lineterminator="\n"
+        ).encode("utf-8")
 
     @staticmethod
     def _write_temp(path: Path, payload: bytes) -> Path:

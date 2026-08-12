@@ -2,7 +2,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -161,6 +161,59 @@ class FailsOnceDuringStockHistoryClient(FixtureClient):
         return history
 
 
+class RangeAwareHistoryClient(FixtureClient):
+    def get_stock_history(self, symbol, start, end):
+        self.history_requests.append((symbol, start, end))
+        history = FixtureClient.get_stock_history(self, symbol, start, end)
+        self.history_requests.pop()
+        return history.loc[history["date"].between(start, end)].reset_index(drop=True)
+
+
+class CrossYearSuspensionClient(FixtureClient):
+    def get_stock_history(self, symbol, start, end):
+        self.history_requests.append((symbol, start, end))
+        if symbol == "600000":
+            return pd.DataFrame(
+                {
+                    "date": [
+                        "2023-12-29",
+                        "2024-12-31",
+                        "2025-01-02",
+                        "2025-01-03",
+                        "2025-01-06",
+                    ],
+                    "symbol": [symbol] * 5,
+                    "current_close": [9.0, 9.0, 9.0, 9.0, 11.0],
+                    "is_suspended": [False, True, True, True, False],
+                }
+            ).loc[lambda frame: frame["date"].between(start, end)]
+        return FixtureClient.get_stock_history(self, symbol, start, end)
+
+
+class SuspendedExchangeClient(FixtureClient):
+    def get_security_universe(self):
+        return pd.DataFrame(
+            {
+                "symbol": ["600000", "600001", "000001", "000002"],
+                "exchange": ["SH", "SH", "SZ", "SZ"],
+                "listing_date": ["2020-01-01"] * 4,
+                "delisting_date": [None] * 4,
+            }
+        )
+
+    def get_stock_history(self, symbol, start, end):
+        self.history_requests.append((symbol, start, end))
+        is_shanghai = symbol.startswith("6")
+        return pd.DataFrame(
+            {
+                "date": ["2024-12-31", "2025-01-02"],
+                "symbol": [symbol, symbol],
+                "current_close": [10.0, 10.0 if is_shanghai else 11.0],
+                "is_suspended": [False, is_shanghai],
+            }
+        ).loc[lambda frame: frame["date"].between(start, end)]
+
+
 class HistoryShapeApi:
     def __init__(self, fixture):
         self.fixture = fixture
@@ -195,8 +248,12 @@ class ProductionShapeFixtureClient(FixtureClient):
         return self.history_client.get_stock_history(symbol, start, end)
 
 
-def make_pipeline(tmp_path: Path, client=None) -> MarketDataPipeline:
-    return MarketDataPipeline(root=tmp_path, client=client or FixtureClient())
+def make_pipeline(tmp_path: Path, client=None, now=None) -> MarketDataPipeline:
+    return MarketDataPipeline(
+        root=tmp_path,
+        client=client or FixtureClient(),
+        now=now,
+    )
 
 
 def published_paths(tmp_path):
@@ -209,17 +266,36 @@ def published_paths(tmp_path):
 
 
 def test_published_manifest_uses_canonical_history_path_keys(tmp_path):
-    make_pipeline(tmp_path).run(date(2025, 1, 2))
+    make_pipeline(
+        tmp_path,
+        now=lambda: datetime(2025, 1, 2, 9, 10, tzinfo=timezone.utc),
+    ).run(date(2025, 1, 2))
 
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
 
-    assert set(manifest) == {"version", "history_csv", "history_json"}
+    assert set(manifest) == {
+        "version",
+        "history_csv",
+        "history_json",
+        "generated_at",
+    }
+    assert manifest["generated_at"] == "2025-01-02T09:10:00Z"
     assert manifest["history_csv"] == (
         f"versions/{manifest['version']}/market_history.csv"
     )
     assert manifest["history_json"] == (
         f"versions/{manifest['version']}/market_history.json"
     )
+
+
+def test_successful_publish_keeps_canonical_csv_identical_to_current_version(tmp_path):
+    make_pipeline(tmp_path).run(date(2025, 1, 6))
+
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    canonical = tmp_path / "data/market_history.csv"
+    current_version = tmp_path / "public/data" / manifest["history_csv"]
+
+    assert canonical.read_bytes() == current_version.read_bytes()
 
 
 def test_full_run_resumes_completed_stock_history_after_failure(tmp_path):
@@ -235,16 +311,41 @@ def test_full_run_resumes_completed_stock_history_after_failure(tmp_path):
     assert requested_symbols.count("000001") == 2
 
 
-def test_successful_publish_removes_request_checkpoint(tmp_path):
-    make_pipeline(tmp_path).run(date(2025, 1, 6), full=True)
+def test_stock_checkpoint_extends_only_the_uncovered_end_range(tmp_path):
+    client = RangeAwareHistoryClient()
+    pipeline = make_pipeline(tmp_path, client)
 
-    checkpoint = (
-        tmp_path
-        / "work"
-        / "market-data-checkpoints"
-        / "2024-12-31_2025-01-06"
-    )
-    assert not checkpoint.exists()
+    first = pipeline._stock_history("600000", "2024-12-31", "2025-01-06")
+    second = pipeline._stock_history("600000", "2024-12-31", "2025-01-07")
+
+    assert first["date"].tolist() == [
+        "2024-12-31",
+        "2025-01-02",
+        "2025-01-03",
+        "2025-01-06",
+    ]
+    assert second["date"].tolist() == [
+        "2024-12-31",
+        "2025-01-02",
+        "2025-01-03",
+        "2025-01-06",
+        "2025-01-07",
+    ]
+    assert client.history_requests == [
+        ("600000", "2024-12-31", "2025-01-06"),
+        ("600000", "2025-01-07", "2025-01-07"),
+    ]
+
+
+def test_successful_publish_keeps_checkpoint_for_incremental_next_as_of(tmp_path):
+    client = RangeAwareHistoryClient()
+    pipeline = make_pipeline(tmp_path, client)
+    pipeline.run(date(2025, 1, 6), full=True)
+
+    pipeline.run(date(2025, 1, 7), full=True)
+
+    assert ("600000", "2025-01-07", "2025-01-07") in client.history_requests
+    assert ("000001", "2025-01-07", "2025-01-07") in client.history_requests
 
 
 def test_rerun_replaces_date_and_rebuilds_cumulative(tmp_path):
@@ -261,6 +362,52 @@ def test_rerun_replaces_date_and_rebuilds_cumulative(tmp_path):
     assert json.loads(json_path.read_text()) == frame.to_dict(
         "records"
     )
+
+
+def test_same_trading_day_second_run_skips_collection_and_manifest_switch(tmp_path):
+    client = FixtureClient()
+    pipeline = make_pipeline(tmp_path, client)
+    pipeline.run(date(2025, 1, 6))
+    manifest_path = tmp_path / "public/data/current.json"
+    before_manifest = manifest_path.read_bytes()
+    before_requests = list(client.history_requests)
+    before_versions = sorted((tmp_path / "public/data/versions").iterdir())
+
+    result = pipeline.run(date(2025, 1, 6))
+
+    assert result.skipped is True
+    assert client.history_requests == before_requests
+    assert manifest_path.read_bytes() == before_manifest
+    assert sorted((tmp_path / "public/data/versions").iterdir()) == before_versions
+
+
+def test_holiday_without_a_new_index_trading_day_is_a_no_op(tmp_path):
+    client = FixtureClient()
+    pipeline = make_pipeline(tmp_path, client)
+    pipeline.run(date(2025, 1, 10), full=True)
+    manifest_path = tmp_path / "public/data/current.json"
+    before_manifest = manifest_path.read_bytes()
+    before_requests = list(client.history_requests)
+
+    result = pipeline.run(date(2025, 1, 11))
+
+    assert result.skipped is True
+    assert client.history_requests == before_requests
+    assert manifest_path.read_bytes() == before_manifest
+
+
+def test_identical_full_recalculation_does_not_create_a_new_version(tmp_path):
+    pipeline = make_pipeline(tmp_path)
+    pipeline.run(date(2025, 1, 6), full=True)
+    manifest_path = tmp_path / "public/data/current.json"
+    before_manifest = manifest_path.read_bytes()
+    before_versions = sorted((tmp_path / "public/data/versions").iterdir())
+
+    result = pipeline.run(date(2025, 1, 6), full=True)
+
+    assert result.skipped is True
+    assert manifest_path.read_bytes() == before_manifest
+    assert sorted((tmp_path / "public/data/versions").iterdir()) == before_versions
 
 
 def test_fills_missing_index_day_outside_recent_five_day_window(tmp_path):
@@ -311,9 +458,35 @@ def test_manifest_is_unchanged_when_version_write_fails(tmp_path, monkeypatch):
     monkeypatch.setattr("scripts.market_data.pipeline.os.replace", fail_version_json_replace)
 
     with pytest.raises(OSError, match="simulated version JSON replacement failure"):
-        make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(date(2025, 1, 6))
+        make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(
+            date(2025, 1, 6), full=True
+        )
 
     assert manifest_path.read_bytes() == before
+
+
+def test_manifest_switch_failure_rolls_back_canonical_csv(tmp_path, monkeypatch):
+    make_pipeline(tmp_path).run(date(2025, 1, 6))
+    manifest_path = tmp_path / "public/data/current.json"
+    canonical_path = tmp_path / "data/market_history.csv"
+    before_manifest = manifest_path.read_bytes()
+    before_canonical = canonical_path.read_bytes()
+    original_replace = os.replace
+
+    def fail_manifest_replace(source, destination):
+        if Path(destination) == manifest_path:
+            raise OSError("simulated manifest switch failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr("scripts.market_data.pipeline.os.replace", fail_manifest_replace)
+
+    with pytest.raises(OSError, match="simulated manifest switch failure"):
+        make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(
+            date(2025, 1, 7), full=True
+        )
+
+    assert manifest_path.read_bytes() == before_manifest
+    assert canonical_path.read_bytes() == before_canonical
 
 
 def test_rejects_existing_dates_that_are_not_index_trading_days(tmp_path):
@@ -352,7 +525,9 @@ def test_publishes_immutable_version_and_switches_only_current_manifest(tmp_path
     first_json = tmp_path / "public/data" / first_manifest["history_json"]
     first_csv = tmp_path / "public/data" / first_manifest["history_csv"]
 
-    make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(date(2025, 1, 6))
+    make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(
+        date(2025, 1, 6), full=True
+    )
 
     second_manifest = json.loads(manifest_path.read_text())
     assert second_manifest["version"] != first_manifest["version"]
@@ -390,6 +565,19 @@ def test_resumed_stock_uses_its_previous_valid_close_after_suspension(tmp_path):
 
     assert frame.loc[frame["date"] == "2025-01-07", "up_count"].item() == 1
     assert frame.loc[frame["date"] == "2025-01-07", "valid_count"].item() == 2
+
+
+def test_cross_year_long_suspension_uses_last_pre_window_valid_close(tmp_path):
+    client = CrossYearSuspensionClient()
+
+    make_pipeline(tmp_path, client).run(date(2025, 1, 6), full=True)
+
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["history_csv"])
+    resumed = frame.loc[frame["date"] == "2025-01-06"].iloc[0]
+    assert resumed["up_count"] == 1
+    assert resumed["valid_count"] == 2
+    assert ("600000", "1990-12-01", "2025-01-06") in client.history_requests
 
 
 def test_resumed_stock_ignores_positive_stale_close_on_suspended_day(tmp_path):
@@ -447,6 +635,32 @@ def test_rejects_abnormal_valid_stock_count_drop_before_manifest_switch(tmp_path
         make_pipeline(tmp_path, FixtureClient(invalid_symbols={"600000"}, invalid_on={"2025-01-07"})).run(date(2025, 1, 7))
 
     assert (tmp_path / "public/data/current.json").read_bytes() == before
+
+
+def test_rejects_universe_drop_even_when_one_remaining_security_is_suspended(tmp_path):
+    pipeline = make_pipeline(tmp_path)
+    prices = pd.DataFrame(
+        {
+            "current_close": [10.0] * 59,
+            "previous_close": [9.0] * 59,
+            "is_suspended": [False] * 58 + [True],
+        }
+    )
+    universe = pd.DataFrame({"symbol": [f"{value:06d}" for value in range(59)]})
+    existing = pd.DataFrame(
+        {
+            "date": INDEX_DATES[:5],
+            "valid_count": [100] * 5,
+        }
+    )
+
+    with pytest.raises(MarketDataValidationError, match="valid stock count dropped"):
+        pipeline._validate_daily_quality("2025-01-09", prices, universe, existing)
+
+
+def test_rejects_exchange_with_only_positive_stale_suspended_prices(tmp_path):
+    with pytest.raises(MarketDataValidationError, match="missing valid exchange breadth"):
+        make_pipeline(tmp_path, SuspendedExchangeClient()).run(date(2025, 1, 2))
 
 
 def test_rejects_excessive_missing_price_or_comparison_ratio_before_publish(tmp_path):
