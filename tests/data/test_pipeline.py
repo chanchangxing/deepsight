@@ -33,6 +33,7 @@ class FixtureClient:
         duplicate_symbols=False,
         close_delta=0.0,
         include_delisted=False,
+        include_old_delisted=False,
         suspended_on=None,
         suspended_close=None,
         invalid_symbols=(),
@@ -43,6 +44,7 @@ class FixtureClient:
         self.duplicate_symbols = duplicate_symbols
         self.close_delta = close_delta
         self.include_delisted = include_delisted
+        self.include_old_delisted = include_old_delisted
         self.suspended_on = suspended_on
         self.suspended_close = suspended_close
         self.invalid_symbols = set(invalid_symbols)
@@ -91,10 +93,27 @@ class FixtureClient:
                 ],
                 ignore_index=True,
             )
+        if self.include_old_delisted:
+            result = pd.concat(
+                [
+                    result,
+                    pd.DataFrame(
+                        {
+                            "symbol": ["000003"],
+                            "exchange": ["SZ"],
+                            "listing_date": ["1991-01-14"],
+                            "delisting_date": ["2002-06-14"],
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
         return result
 
     def get_stock_history(self, symbol, start, end):
         self.history_requests.append((symbol, start, end))
+        if symbol == "000003":
+            raise AssertionError("out-of-window delisted symbol must not be requested")
         closes = {
             "600000": [9.0, 10.0, 11.0, 10.0, 10.0, 12.0, 11.0, 12.0, 13.0],
             "000001": [20.0, 20.0, 19.0, 19.0, 22.0, 21.0, 21.0, 20.0, 21.0],
@@ -350,6 +369,15 @@ def test_full_history_keeps_delisted_stock_until_its_delisting_date(tmp_path):
 
     assert frame.loc[frame["date"] == "2025-01-06", "valid_count"].item() == 3
     assert frame.loc[frame["date"] == "2025-01-08", "valid_count"].item() == 2
+
+
+def test_full_history_does_not_request_stock_delisted_before_history_window(tmp_path):
+    client = FixtureClient(include_old_delisted=True)
+
+    make_pipeline(tmp_path, client).run(date(2025, 1, 8), full=True)
+
+    requested_symbols = [symbol for symbol, _, _ in client.history_requests]
+    assert "000003" not in requested_symbols
 
 
 def test_resumed_stock_uses_its_previous_valid_close_after_suspension(tmp_path):

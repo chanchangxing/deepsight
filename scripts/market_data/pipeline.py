@@ -194,6 +194,11 @@ class MarketDataPipeline:
         if not {"SH", "SZ"}.issubset(exchanges):
             raise MarketDataValidationError("both Shanghai and Shenzhen markets are required")
 
+        market = market.loc[
+            market["delisting_date"].isna()
+            | (market["delisting_date"] >= HISTORY_START.isoformat())
+        ].reset_index(drop=True)
+
         history_start = (HISTORY_START - timedelta(days=1)).isoformat()
         histories = []
         for symbol in market["symbol"]:
