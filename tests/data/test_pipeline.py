@@ -33,15 +33,21 @@ class FixtureClient:
         close_delta=0.0,
         include_delisted=False,
         suspended_on=None,
+        suspended_close=None,
         invalid_symbols=(),
         invalid_on=(),
+        omit_symbols=(),
+        close_overrides=None,
     ):
         self.duplicate_symbols = duplicate_symbols
         self.close_delta = close_delta
         self.include_delisted = include_delisted
         self.suspended_on = suspended_on
+        self.suspended_close = suspended_close
         self.invalid_symbols = set(invalid_symbols)
         self.invalid_on = set(invalid_on)
+        self.omit_symbols = set(omit_symbols)
+        self.close_overrides = close_overrides or {}
         self.history_requests = []
 
     def get_index_history(self, start, end):
@@ -95,14 +101,18 @@ class FixtureClient:
         }[symbol]
         if self.suspended_on and symbol == "600000":
             closes = list(closes)
-            closes[INDEX_DATES.index(self.suspended_on) + 1] = None
+            closes[INDEX_DATES.index(self.suspended_on) + 1] = self.suspended_close
         if symbol in self.invalid_symbols and not self.invalid_on:
             closes = [None] * len(closes)
         elif symbol in self.invalid_symbols:
             closes = list(closes)
             for day in self.invalid_on:
                 closes[INDEX_DATES.index(day) + 1] = None
-        return pd.DataFrame(
+        for (override_symbol, override_date), value in self.close_overrides.items():
+            if symbol == override_symbol:
+                closes = list(closes)
+                closes[INDEX_DATES.index(override_date) + 1] = value
+        frame = pd.DataFrame(
             {
                 "date": ["2024-12-31", *INDEX_DATES],
                 "symbol": [symbol] * 9,
@@ -113,6 +123,7 @@ class FixtureClient:
                 ],
             }
         )
+        return frame.loc[~((frame["symbol"].isin(self.omit_symbols)) & (frame["date"].isin(self.invalid_on)))].reset_index(drop=True)
 
 
 def make_pipeline(tmp_path: Path, client=None) -> MarketDataPipeline:
@@ -250,13 +261,42 @@ def test_full_history_keeps_delisted_stock_until_its_delisting_date(tmp_path):
 
 
 def test_resumed_stock_uses_its_previous_valid_close_after_suspension(tmp_path):
-    make_pipeline(tmp_path, FixtureClient(suspended_on="2025-01-06")).run(date(2025, 1, 7), full=True)
+    make_pipeline(
+        tmp_path, FixtureClient(suspended_on="2025-01-06", suspended_close=None)
+    ).run(date(2025, 1, 7), full=True)
 
     manifest = json.loads((tmp_path / "public/data/current.json").read_text())
     frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
 
     assert frame.loc[frame["date"] == "2025-01-07", "up_count"].item() == 1
     assert frame.loc[frame["date"] == "2025-01-07", "valid_count"].item() == 2
+
+
+def test_resumed_stock_ignores_positive_stale_close_on_suspended_day(tmp_path):
+    make_pipeline(
+        tmp_path,
+        FixtureClient(
+            suspended_on="2025-01-06",
+            suspended_close=99.0,
+            close_overrides={("600000", "2025-01-07"): 12.0},
+        ),
+    ).run(date(2025, 1, 7), full=True)
+
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+
+    assert frame.loc[frame["date"] == "2025-01-07", "up_count"].item() == 2
+    assert frame.loc[frame["date"] == "2025-01-07", "down_count"].item() == 0
+
+
+def test_rejects_first_run_when_active_stock_is_completely_missing_for_the_day(tmp_path):
+    with pytest.raises(MarketDataValidationError, match="missing price/comparison ratio"):
+        make_pipeline(
+            tmp_path,
+            FixtureClient(omit_symbols={"600000"}, invalid_on={"2025-01-02"}),
+        ).run(date(2025, 1, 2))
+
+    assert not (tmp_path / "public/data/current.json").exists()
 
 
 def test_first_published_index_change_uses_prior_trading_day_close(tmp_path):

@@ -220,8 +220,11 @@ class MarketDataPipeline:
         market["listing_date"] = market["listing_date"].fillna(
             market["symbol"].map(first_valid_dates)
         )
-        prices["previous_close"] = prices.groupby("symbol", sort=False)["current_close"].transform(
-            lambda closes: closes.where(closes.gt(0)).ffill().shift()
+        valid_closes = prices["current_close"].where(
+            prices["current_close"].gt(0) & ~prices["is_suspended"].fillna(False)
+        )
+        prices["previous_close"] = valid_closes.groupby(prices["symbol"], sort=False).transform(
+            lambda closes: closes.ffill().shift()
         )
 
         index_changes = calculate_index_changes(index_history).set_index("date")
@@ -231,8 +234,12 @@ class MarketDataPipeline:
                 (market["listing_date"].isna() | (market["listing_date"] <= value))
                 & (market["delisting_date"].isna() | (market["delisting_date"] >= value))
             ]
-            daily_prices = prices.loc[prices["date"] == value].merge(
-                active_market[["symbol", "exchange"]], on="symbol", how="inner"
+            daily_prices = active_market[["symbol", "exchange"]].merge(
+                prices.loc[prices["date"] == value, [
+                    "symbol", "current_close", "is_suspended", "previous_close"
+                ]],
+                on="symbol",
+                how="left",
             )
             pending_records = pd.DataFrame(records)
             quality_history = (

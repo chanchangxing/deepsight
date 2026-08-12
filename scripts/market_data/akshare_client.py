@@ -112,16 +112,21 @@ class AkshareClient:
         current["delisting_date"] = None
         shanghai = self._normalize_delisted_market(
             self._with_retry(
-                lambda: self._require_api().stock_info_sh_delist(indicator="终止上市公司")
+                lambda: self._require_api().stock_info_sh_delist(symbol="全部")
             ),
             "SH",
-            symbol_columns=("symbol", "SECURITY_CODE_A", "证券代码"),
+            symbol_columns=("symbol", "公司代码", "SECURITY_CODE_A", "证券代码"),
             listing_columns=("listing_date", "LISTING_DATE", "上市日期"),
-            delisting_columns=("delisting_date", "CHANGE_DATE", "终止上市日期"),
+            delisting_columns=(
+                "delisting_date",
+                "暂停上市日期",
+                "CHANGE_DATE",
+                "终止上市日期",
+            ),
         )
         shenzhen = self._normalize_delisted_market(
             self._with_retry(
-                lambda: self._require_api().stock_info_sz_delist(indicator="终止上市公司")
+                lambda: self._require_api().stock_info_sz_delist(symbol="终止上市公司")
             ),
             "SZ",
             symbol_columns=("symbol", "证券代码", "代码"),

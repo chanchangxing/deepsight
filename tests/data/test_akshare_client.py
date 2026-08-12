@@ -48,18 +48,18 @@ class FakeAkshareApi:
             }
         )
 
-    def stock_info_sh_delist(self, indicator):
-        assert indicator == "终止上市公司"
+    def stock_info_sh_delist(self, symbol="全部"):
+        assert symbol == "全部"
         return pd.DataFrame(
             {
-                "SECURITY_CODE_A": ["600999", "900999"],
-                "LISTING_DATE": ["2020-01-01", "2020-01-01"],
-                "CHANGE_DATE": ["2025-01-07", "2025-01-07"],
+                "公司代码": ["600999", "900999"],
+                "上市日期": ["2020-01-01", "2020-01-01"],
+                "暂停上市日期": ["2025-01-07", "2025-01-07"],
             }
         )
 
-    def stock_info_sz_delist(self, indicator):
-        assert indicator == "终止上市公司"
+    def stock_info_sz_delist(self, symbol="终止上市公司"):
+        assert symbol == "终止上市公司"
         return pd.DataFrame(
             {
                 "证券代码": ["000999", "200999"],
