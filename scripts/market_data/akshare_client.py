@@ -105,6 +105,33 @@ class AkshareClient:
         )
         return pd.concat([shanghai, shenzhen], ignore_index=True)
 
+    def get_security_universe(self) -> pd.DataFrame:
+        """Return current and delisted eligible A shares with lifecycle boundaries."""
+        current = self.get_current_market().loc[:, ["symbol", "exchange"]].copy()
+        current["listing_date"] = None
+        current["delisting_date"] = None
+        shanghai = self._normalize_delisted_market(
+            self._with_retry(
+                lambda: self._require_api().stock_info_sh_delist(indicator="终止上市公司")
+            ),
+            "SH",
+            symbol_columns=("symbol", "SECURITY_CODE_A", "证券代码"),
+            listing_columns=("listing_date", "LISTING_DATE", "上市日期"),
+            delisting_columns=("delisting_date", "CHANGE_DATE", "终止上市日期"),
+        )
+        shenzhen = self._normalize_delisted_market(
+            self._with_retry(
+                lambda: self._require_api().stock_info_sz_delist(indicator="终止上市公司")
+            ),
+            "SZ",
+            symbol_columns=("symbol", "证券代码", "代码"),
+            listing_columns=("listing_date", "上市日期", "LISTING_DATE"),
+            delisting_columns=("delisting_date", "终止上市日期", "CHANGE_DATE"),
+        )
+        result = pd.concat([current, shanghai, shenzhen], ignore_index=True)
+        result = result.drop_duplicates("symbol", keep="first")
+        return result.sort_values("symbol").reset_index(drop=True)
+
     def get_stock_history(self, symbol: str, start: str, end: str) -> pd.DataFrame:
         if not self._is_a_share_symbol(symbol):
             raise ValueError(
@@ -149,6 +176,32 @@ class AkshareClient:
 
         prefixes = SH_A_SHARE_PREFIXES if exchange == "SH" else SZ_A_SHARE_PREFIXES
         return result.loc[result["symbol"].str.startswith(prefixes)].reset_index(drop=True)
+
+    def _normalize_delisted_market(
+        self,
+        frame: pd.DataFrame,
+        exchange: str,
+        symbol_columns: tuple[str, ...],
+        listing_columns: tuple[str, ...],
+        delisting_columns: tuple[str, ...],
+    ) -> pd.DataFrame:
+        result = self._normalize(
+            frame,
+            {
+                "symbol": symbol_columns,
+                "listing_date": listing_columns,
+                "delisting_date": delisting_columns,
+            },
+        )
+        result["symbol"] = result["symbol"].astype(str).str.zfill(6)
+        for column in ("listing_date", "delisting_date"):
+            result[column] = pd.to_datetime(result[column], errors="raise").dt.strftime(
+                "%Y-%m-%d"
+            )
+        prefixes = SH_A_SHARE_PREFIXES if exchange == "SH" else SZ_A_SHARE_PREFIXES
+        result = result.loc[result["symbol"].str.startswith(prefixes)].copy()
+        result["exchange"] = exchange
+        return result[["symbol", "exchange", "listing_date", "delisting_date"]]
 
     @staticmethod
     def _is_a_share_symbol(symbol: str) -> bool:

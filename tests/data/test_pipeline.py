@@ -27,20 +27,28 @@ INDEX_DATES = [
 
 
 class FixtureClient:
-    def __init__(self, duplicate_symbols=False, close_delta=0.0):
+    def __init__(
+        self,
+        duplicate_symbols=False,
+        close_delta=0.0,
+        include_delisted=False,
+        suspended_on=None,
+        invalid_symbols=(),
+        invalid_on=(),
+    ):
         self.duplicate_symbols = duplicate_symbols
         self.close_delta = close_delta
+        self.include_delisted = include_delisted
+        self.suspended_on = suspended_on
+        self.invalid_symbols = set(invalid_symbols)
+        self.invalid_on = set(invalid_on)
         self.history_requests = []
 
     def get_index_history(self, start, end):
+        dates = ["2024-12-31", *INDEX_DATES]
+        closes = [3190.0, 3200.0, 3210.0, 3205.0, 3220.0, 3215.0, 3230.0, 3225.0, 3240.0]
         return pd.DataFrame(
-            {
-                "date": INDEX_DATES,
-                "close": [
-                    value + self.close_delta
-                    for value in [3200.0, 3210.0, 3205.0, 3220.0, 3215.0, 3230.0, 3225.0, 3240.0]
-                ],
-            }
+            {"date": dates, "close": [value + self.close_delta for value in closes]}
         )
 
     def get_current_market(self):
@@ -57,17 +65,52 @@ class FixtureClient:
             }
         )
 
+    def get_security_universe(self):
+        result = self.get_current_market().loc[:, ["symbol", "exchange"]].copy()
+        result["listing_date"] = "2020-01-01"
+        result["delisting_date"] = None
+        if self.include_delisted:
+            result = pd.concat(
+                [
+                    result,
+                    pd.DataFrame(
+                        {
+                            "symbol": ["600999"],
+                            "exchange": ["SH"],
+                            "listing_date": ["2020-01-01"],
+                            "delisting_date": ["2025-01-07"],
+                        }
+                    ),
+                ],
+                ignore_index=True,
+            )
+        return result
+
     def get_stock_history(self, symbol, start, end):
         self.history_requests.append((symbol, start, end))
         closes = {
             "600000": [9.0, 10.0, 11.0, 10.0, 10.0, 12.0, 11.0, 12.0, 13.0],
             "000001": [20.0, 20.0, 19.0, 19.0, 22.0, 21.0, 21.0, 20.0, 21.0],
+            "600999": [10.0, 11.0, 12.0, 13.0, 14.0, None, None, None, None],
         }[symbol]
+        if self.suspended_on and symbol == "600000":
+            closes = list(closes)
+            closes[INDEX_DATES.index(self.suspended_on) + 1] = None
+        if symbol in self.invalid_symbols and not self.invalid_on:
+            closes = [None] * len(closes)
+        elif symbol in self.invalid_symbols:
+            closes = list(closes)
+            for day in self.invalid_on:
+                closes[INDEX_DATES.index(day) + 1] = None
         return pd.DataFrame(
             {
                 "date": ["2024-12-31", *INDEX_DATES],
                 "symbol": [symbol] * 9,
                 "current_close": closes,
+                "is_suspended": [
+                    symbol == "600000" and value == self.suspended_on
+                    for value in ["2024-12-31", *INDEX_DATES]
+                ],
             }
         )
 
@@ -76,16 +119,24 @@ def make_pipeline(tmp_path: Path, client=None) -> MarketDataPipeline:
     return MarketDataPipeline(root=tmp_path, client=client or FixtureClient())
 
 
+def published_paths(tmp_path):
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    public_data = tmp_path / "public/data"
+    return public_data / manifest["csv"], public_data / manifest["json"]
+
+
 def test_rerun_replaces_date_and_rebuilds_cumulative(tmp_path):
     pipeline = make_pipeline(tmp_path)
 
     pipeline.run(date(2025, 1, 6))
     pipeline.run(date(2025, 1, 6))
 
-    frame = pd.read_csv(tmp_path / "data/market_history.csv")
+    _, json_path = published_paths(tmp_path)
+    csv_path, _ = published_paths(tmp_path)
+    frame = pd.read_csv(csv_path)
     assert frame["date"].is_unique
     assert frame["cumulative_diff"].tolist() == [1, 1, 0]
-    assert json.loads((tmp_path / "public/data/market_history.json").read_text()) == frame.to_dict(
+    assert json.loads(json_path.read_text()) == frame.to_dict(
         "records"
     )
 
@@ -93,7 +144,7 @@ def test_rerun_replaces_date_and_rebuilds_cumulative(tmp_path):
 def test_fills_missing_index_day_outside_recent_five_day_window(tmp_path):
     pipeline = make_pipeline(tmp_path)
     pipeline.run(date(2025, 1, 13), full=True)
-    history_path = tmp_path / "data/market_history.csv"
+    history_path, _ = published_paths(tmp_path)
     history = pd.read_csv(history_path)
     history = history.loc[history["date"] != "2025-01-03"]
     history["cumulative_diff"] = history["daily_diff"].cumsum()
@@ -101,7 +152,8 @@ def test_fills_missing_index_day_outside_recent_five_day_window(tmp_path):
 
     result = pipeline.run(date(2025, 1, 13))
 
-    frame = pd.read_csv(history_path)
+    current_csv, _ = published_paths(tmp_path)
+    frame = pd.read_csv(current_csv)
     assert "2025-01-03" in result.updated_dates
     assert frame["date"].tolist() == INDEX_DATES
     assert frame["cumulative_diff"].tolist() == [1, 1, 0, 1, 1, 0, 0, 2]
@@ -110,8 +162,7 @@ def test_fills_missing_index_day_outside_recent_five_day_window(tmp_path):
 def test_validation_failure_preserves_published_csv_and_json(tmp_path):
     published_pipeline = make_pipeline(tmp_path)
     published_pipeline.run(date(2025, 1, 6))
-    csv_path = tmp_path / "data/market_history.csv"
-    json_path = tmp_path / "public/data/market_history.json"
+    csv_path, json_path = published_paths(tmp_path)
     before_csv = csv_path.read_bytes()
     before_json = json_path.read_bytes()
 
@@ -124,31 +175,28 @@ def test_validation_failure_preserves_published_csv_and_json(tmp_path):
     assert json_path.read_bytes() == before_json
 
 
-def test_second_atomic_replace_failure_restores_both_published_files(tmp_path, monkeypatch):
+def test_manifest_is_unchanged_when_version_write_fails(tmp_path, monkeypatch):
     make_pipeline(tmp_path).run(date(2025, 1, 6))
-    csv_path = tmp_path / "data/market_history.csv"
-    json_path = tmp_path / "public/data/market_history.json"
-    before_csv = csv_path.read_bytes()
-    before_json = json_path.read_bytes()
+    manifest_path = tmp_path / "public/data/current.json"
+    before = manifest_path.read_bytes()
     original_replace = os.replace
 
-    def fail_json_replace(source, destination):
-        if Path(destination) == json_path:
-            raise OSError("simulated JSON replacement failure")
+    def fail_version_json_replace(source, destination):
+        if str(destination).endswith("market_history.json"):
+            raise OSError("simulated version JSON replacement failure")
         return original_replace(source, destination)
 
-    monkeypatch.setattr("scripts.market_data.pipeline.os.replace", fail_json_replace)
+    monkeypatch.setattr("scripts.market_data.pipeline.os.replace", fail_version_json_replace)
 
-    with pytest.raises(OSError, match="simulated JSON replacement failure"):
+    with pytest.raises(OSError, match="simulated version JSON replacement failure"):
         make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(date(2025, 1, 6))
 
-    assert csv_path.read_bytes() == before_csv
-    assert json_path.read_bytes() == before_json
+    assert manifest_path.read_bytes() == before
 
 
 def test_rejects_existing_dates_that_are_not_index_trading_days(tmp_path):
     make_pipeline(tmp_path).run(date(2025, 1, 6))
-    csv_path = tmp_path / "data/market_history.csv"
+    csv_path, _ = published_paths(tmp_path)
     history = pd.read_csv(csv_path)
     weekend = history.iloc[[1]].copy()
     weekend["date"] = "2025-01-04"
@@ -173,3 +221,66 @@ def test_update_cli_runs_as_a_script_without_import_path_setup():
 
     assert result.returncode == 0
     assert "--full" in result.stdout
+
+
+def test_publishes_immutable_version_and_switches_only_current_manifest(tmp_path):
+    make_pipeline(tmp_path).run(date(2025, 1, 6))
+    manifest_path = tmp_path / "public/data/current.json"
+    first_manifest = json.loads(manifest_path.read_text())
+    first_json = tmp_path / "public/data" / first_manifest["json"]
+    first_csv = tmp_path / "public/data" / first_manifest["csv"]
+
+    make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(date(2025, 1, 6))
+
+    second_manifest = json.loads(manifest_path.read_text())
+    assert second_manifest["version"] != first_manifest["version"]
+    assert first_json.exists() and first_csv.exists()
+    assert (tmp_path / "public/data" / second_manifest["json"]).exists()
+    assert (tmp_path / "public/data" / second_manifest["csv"]).exists()
+
+
+def test_full_history_keeps_delisted_stock_until_its_delisting_date(tmp_path):
+    make_pipeline(tmp_path, FixtureClient(include_delisted=True)).run(date(2025, 1, 8), full=True)
+
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+
+    assert frame.loc[frame["date"] == "2025-01-06", "valid_count"].item() == 3
+    assert frame.loc[frame["date"] == "2025-01-08", "valid_count"].item() == 2
+
+
+def test_resumed_stock_uses_its_previous_valid_close_after_suspension(tmp_path):
+    make_pipeline(tmp_path, FixtureClient(suspended_on="2025-01-06")).run(date(2025, 1, 7), full=True)
+
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+
+    assert frame.loc[frame["date"] == "2025-01-07", "up_count"].item() == 1
+    assert frame.loc[frame["date"] == "2025-01-07", "valid_count"].item() == 2
+
+
+def test_first_published_index_change_uses_prior_trading_day_close(tmp_path):
+    make_pipeline(tmp_path).run(date(2025, 1, 2))
+
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["csv"])
+
+    assert frame.loc[0, "shanghai_change"] == 10.0
+    assert frame.loc[0, "shanghai_change_pct"] == pytest.approx(0.3134796238244514)
+
+
+def test_rejects_abnormal_valid_stock_count_drop_before_manifest_switch(tmp_path):
+    make_pipeline(tmp_path).run(date(2025, 1, 6), full=True)
+    before = (tmp_path / "public/data/current.json").read_bytes()
+
+    with pytest.raises(MarketDataValidationError, match="valid stock count dropped"):
+        make_pipeline(tmp_path, FixtureClient(invalid_symbols={"600000"}, invalid_on={"2025-01-07"})).run(date(2025, 1, 7))
+
+    assert (tmp_path / "public/data/current.json").read_bytes() == before
+
+
+def test_rejects_excessive_missing_price_or_comparison_ratio_before_publish(tmp_path):
+    with pytest.raises(MarketDataValidationError, match="missing price/comparison ratio"):
+        make_pipeline(tmp_path, FixtureClient(invalid_symbols={"600000"})).run(date(2025, 1, 6))
+
+    assert not (tmp_path / "public/data/current.json").exists()

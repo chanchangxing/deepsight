@@ -48,6 +48,26 @@ class FakeAkshareApi:
             }
         )
 
+    def stock_info_sh_delist(self, indicator):
+        assert indicator == "终止上市公司"
+        return pd.DataFrame(
+            {
+                "SECURITY_CODE_A": ["600999", "900999"],
+                "LISTING_DATE": ["2020-01-01", "2020-01-01"],
+                "CHANGE_DATE": ["2025-01-07", "2025-01-07"],
+            }
+        )
+
+    def stock_info_sz_delist(self, indicator):
+        assert indicator == "终止上市公司"
+        return pd.DataFrame(
+            {
+                "证券代码": ["000999", "200999"],
+                "上市日期": ["2020-01-01", "2020-01-01"],
+                "终止上市日期": ["2025-01-07", "2025-01-07"],
+            }
+        )
+
 
 def test_retry_uses_three_delays():
     outcomes = iter([TimeoutError(), TimeoutError(), TimeoutError(), SAMPLE_FRAME])
@@ -129,6 +149,19 @@ def test_current_market_filters_to_shanghai_and_shenzhen_a_shares():
     ]
     assert result.loc[result["symbol"] == "688001", "is_suspended"].item() is True
     assert set(result["exchange"]) == {"SH", "SZ"}
+
+
+def test_security_universe_merges_current_and_delisted_a_shares_with_lifecycle_dates():
+    result = AkshareClient(api=FakeAkshareApi()).get_security_universe()
+
+    assert result.to_dict("records") == [
+        {"symbol": "000001", "exchange": "SZ", "listing_date": None, "delisting_date": None},
+        {"symbol": "000999", "exchange": "SZ", "listing_date": "2020-01-01", "delisting_date": "2025-01-07"},
+        {"symbol": "300001", "exchange": "SZ", "listing_date": None, "delisting_date": None},
+        {"symbol": "600000", "exchange": "SH", "listing_date": None, "delisting_date": None},
+        {"symbol": "600999", "exchange": "SH", "listing_date": "2020-01-01", "delisting_date": "2025-01-07"},
+        {"symbol": "688001", "exchange": "SH", "listing_date": None, "delisting_date": None},
+    ]
 
 
 def test_get_stock_history_uses_unadjusted_daily_prices_and_normalizes_columns():

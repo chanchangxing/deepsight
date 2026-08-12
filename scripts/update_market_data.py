@@ -19,7 +19,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="force a full refresh even when recent records already exist",
+        help="alias for --full; rebuild the complete history",
     )
     return parser.parse_args(argv)
 

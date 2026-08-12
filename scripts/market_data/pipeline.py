@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import uuid
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -18,6 +19,10 @@ from .calculations import add_cumulative_diff, calculate_index_changes, classify
 
 
 HISTORY_START = date(2025, 1, 1)
+INDEX_LOOKBACK_DAYS = 31
+RECENT_VALID_COUNT_DAYS = 5
+MIN_VALID_COUNT_RATIO = 0.60
+MAX_MISSING_PRICE_OR_COMPARISON_RATIO = 0.20
 REQUIRED_COLUMNS = [
     "date",
     "shanghai_close",
@@ -87,7 +92,8 @@ class MarketDataPipeline:
         self.root = Path(root) if root is not None else Path(__file__).resolve().parents[2]
         self.client = client if client is not None else AkshareClient()
         self.csv_path = self.root / "data" / "market_history.csv"
-        self.json_path = self.root / "public" / "data" / "market_history.json"
+        self.public_data_path = self.root / "public" / "data"
+        self.manifest_path = self.public_data_path / "current.json"
 
     def run(self, as_of: date, full: bool = False) -> UpdateResult:
         if as_of < HISTORY_START:
@@ -96,7 +102,9 @@ class MarketDataPipeline:
         existing = self._read_history()
         validate_history(existing)
         index_history = self._index_history(as_of)
-        index_dates = index_history["date"].tolist()
+        index_dates = index_history.loc[
+            index_history["date"] >= HISTORY_START.isoformat(), "date"
+        ].tolist()
         non_trading_dates = set(existing["date"]).difference(index_dates)
         if non_trading_dates:
             raise MarketDataValidationError(
@@ -114,7 +122,7 @@ class MarketDataPipeline:
         if not dates_to_update:
             return UpdateResult((), skipped=True)
 
-        replacements = self._collect_records(index_history, dates_to_update, as_of)
+        replacements = self._collect_records(index_history, dates_to_update, as_of, existing)
         retained = existing.loc[~existing["date"].isin(dates_to_update)]
         combined = replacements if retained.empty else pd.concat([retained, replacements], ignore_index=True)
         combined = combined.loc[:, REQUIRED_COLUMNS].sort_values("date").reset_index(drop=True)
@@ -124,15 +132,23 @@ class MarketDataPipeline:
         return UpdateResult(tuple(dates_to_update))
 
     def _read_history(self) -> pd.DataFrame:
-        if not self.csv_path.exists():
+        source = self.csv_path
+        if self.manifest_path.exists():
+            try:
+                manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+                source = self.public_data_path / manifest["csv"]
+            except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+                raise MarketDataValidationError(f"cannot read current manifest: {error}") from error
+        if not source.exists():
             return pd.DataFrame(columns=REQUIRED_COLUMNS)
         try:
-            return pd.read_csv(self.csv_path, dtype={"date": str})
+            return pd.read_csv(source, dtype={"date": str})
         except (OSError, pd.errors.ParserError, ValueError) as error:
             raise MarketDataValidationError(f"cannot read existing history: {error}") from error
 
     def _index_history(self, as_of: date) -> pd.DataFrame:
-        frame = self.client.get_index_history(HISTORY_START.isoformat(), as_of.isoformat()).copy()
+        start = HISTORY_START - timedelta(days=INDEX_LOOKBACK_DAYS)
+        frame = self.client.get_index_history(start.isoformat(), as_of.isoformat()).copy()
         if not {"date", "close"}.issubset(frame.columns):
             raise MarketDataValidationError("index history is missing date or close")
         try:
@@ -143,8 +159,7 @@ class MarketDataPipeline:
         except (TypeError, ValueError) as error:
             raise MarketDataValidationError(f"invalid index history: {error}") from error
         frame = frame.loc[
-            (frame["date"] >= HISTORY_START.isoformat())
-            & (frame["date"] <= as_of.isoformat()),
+            (frame["date"] <= as_of.isoformat()),
             ["date", "close"],
         ].sort_values("date").reset_index(drop=True)
         if frame["date"].duplicated().any():
@@ -154,10 +169,14 @@ class MarketDataPipeline:
         return frame
 
     def _collect_records(
-        self, index_history: pd.DataFrame, dates_to_update: list[str], as_of: date
+        self,
+        index_history: pd.DataFrame,
+        dates_to_update: list[str],
+        as_of: date,
+        existing: pd.DataFrame,
     ) -> pd.DataFrame:
-        market = self.client.get_current_market().copy()
-        required_market_columns = {"symbol", "exchange"}
+        market = self.client.get_security_universe().copy()
+        required_market_columns = {"symbol", "exchange", "listing_date", "delisting_date"}
         if not required_market_columns.issubset(market.columns):
             raise MarketDataValidationError("market snapshot is missing symbol or exchange")
         market["symbol"] = market["symbol"].astype(str).str.zfill(6)
@@ -174,7 +193,9 @@ class MarketDataPipeline:
             if not {"date", "current_close"}.issubset(history.columns):
                 raise MarketDataValidationError(f"stock history is incomplete for {symbol}")
             history["symbol"] = symbol
-            histories.append(history[["date", "symbol", "current_close"]])
+            if "is_suspended" not in history:
+                history["is_suspended"] = False
+            histories.append(history[["date", "symbol", "current_close", "is_suspended"]])
         if not histories:
             raise MarketDataValidationError("empty market snapshot")
 
@@ -191,15 +212,49 @@ class MarketDataPipeline:
         )
         if prices.duplicated(["symbol", "date"]).any():
             raise MarketDataValidationError("duplicate stock history dates")
-        prices["previous_close"] = prices.groupby("symbol", sort=False)["current_close"].shift()
+        first_valid_dates = (
+            prices.loc[prices["current_close"].gt(0)]
+            .groupby("symbol")["date"]
+            .min()
+        )
+        market["listing_date"] = market["listing_date"].fillna(
+            market["symbol"].map(first_valid_dates)
+        )
+        prices["previous_close"] = prices.groupby("symbol", sort=False)["current_close"].transform(
+            lambda closes: closes.where(closes.gt(0)).ffill().shift()
+        )
 
         index_changes = calculate_index_changes(index_history).set_index("date")
         records = []
         for value in dates_to_update:
-            daily_prices = prices.loc[prices["date"] == value]
+            active_market = market.loc[
+                (market["listing_date"].isna() | (market["listing_date"] <= value))
+                & (market["delisting_date"].isna() | (market["delisting_date"] >= value))
+            ]
+            daily_prices = prices.loc[prices["date"] == value].merge(
+                active_market[["symbol", "exchange"]], on="symbol", how="inner"
+            )
+            pending_records = pd.DataFrame(records)
+            quality_history = (
+                existing
+                if pending_records.empty
+                else pd.concat([existing, pending_records], ignore_index=True)
+            )
+            self._validate_daily_quality(value, daily_prices, active_market, quality_history)
             counts = classify_breadth(daily_prices)
             if counts.valid == 0:
                 raise MarketDataValidationError(f"no valid stock prices for {value}")
+            active_by_exchange = active_market.groupby("exchange").size()
+            valid_by_exchange = daily_prices.loc[
+                daily_prices["current_close"].gt(0) & daily_prices["previous_close"].gt(0)
+            ].groupby("exchange").size()
+            required_exchanges = {
+                exchange
+                for exchange, size in active_by_exchange.items()
+                if size > 1
+            }
+            if not required_exchanges.issubset(valid_by_exchange.index):
+                raise MarketDataValidationError(f"missing valid exchange breadth for {value}")
             index = index_changes.loc[value]
             records.append(
                 {
@@ -217,49 +272,68 @@ class MarketDataPipeline:
             )
         return pd.DataFrame(records, columns=REQUIRED_COLUMNS)
 
+    def _validate_daily_quality(
+        self,
+        value: str,
+        prices: pd.DataFrame,
+        universe: pd.DataFrame,
+        existing: pd.DataFrame,
+    ) -> None:
+        if universe.empty:
+            raise MarketDataValidationError(f"empty historical security universe for {value}")
+        expected = len(universe)
+        available = prices["current_close"].gt(0)
+        comparable = available & prices["previous_close"].gt(0)
+        suspended = prices.get("is_suspended", pd.Series(False, index=prices.index)).fillna(False)
+        quality_expected = int((~suspended).sum())
+        missing_ratio = 1 - (int(comparable.sum()) / quality_expected) if quality_expected else 0
+        prior = existing.loc[existing["date"] < value, "valid_count"].tail(
+            RECENT_VALID_COUNT_DAYS
+        )
+        if (
+            not prior.empty
+            and not suspended.any()
+            and int(comparable.sum()) < prior.median() * MIN_VALID_COUNT_RATIO
+        ):
+            raise MarketDataValidationError(f"valid stock count dropped for {value}")
+        if missing_ratio > MAX_MISSING_PRICE_OR_COMPARISON_RATIO:
+            raise MarketDataValidationError(
+                f"missing price/comparison ratio {missing_ratio:.1%} exceeds "
+                f"{MAX_MISSING_PRICE_OR_COMPARISON_RATIO:.1%} for {value}"
+            )
+
     def _atomic_publish(self, frame: pd.DataFrame) -> None:
         csv_bytes = frame.to_csv(index=False).encode("utf-8")
         csv_frame = pd.read_csv(io.BytesIO(csv_bytes), dtype={"date": str})
         json_bytes = json.dumps(
             csv_frame.to_dict(orient="records"), ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
-        previous_csv = self.csv_path.read_bytes() if self.csv_path.exists() else None
-        previous_json = self.json_path.read_bytes() if self.json_path.exists() else None
-        csv_temp = self._write_temp(self.csv_path, csv_bytes)
+        version = uuid.uuid4().hex
+        version_path = self.public_data_path / "versions" / version
+        version_path.mkdir(parents=True, exist_ok=False)
+        csv_path = version_path / "market_history.csv"
+        json_path = version_path / "market_history.json"
+        csv_temp = self._write_temp(csv_path, csv_bytes)
+        json_temp = self._write_temp(json_path, json_bytes)
         try:
-            json_temp = self._write_temp(self.json_path, json_bytes)
-        except Exception:
-            csv_temp.unlink(missing_ok=True)
-            raise
-
-        csv_replaced = False
-        json_replaced = False
-        try:
-            os.replace(csv_temp, self.csv_path)
-            csv_replaced = True
-            os.replace(json_temp, self.json_path)
-            json_replaced = True
-            self._fsync_directory(self.csv_path.parent)
-            self._fsync_directory(self.json_path.parent)
-        except Exception:
-            if json_replaced:
-                self._restore_published_file(self.json_path, previous_json)
-            if csv_replaced:
-                self._restore_published_file(self.csv_path, previous_csv)
-            raise
+            os.replace(csv_temp, csv_path)
+            os.replace(json_temp, json_path)
+            self._fsync_directory(version_path)
+            manifest = {
+                "version": version,
+                "csv": f"versions/{version}/market_history.csv",
+                "json": f"versions/{version}/market_history.json",
+            }
+            manifest_bytes = json.dumps(manifest, separators=(",", ":")).encode("utf-8")
+            manifest_temp = self._write_temp(self.manifest_path, manifest_bytes)
+            try:
+                os.replace(manifest_temp, self.manifest_path)
+                self._fsync_directory(self.public_data_path)
+            finally:
+                manifest_temp.unlink(missing_ok=True)
         finally:
             csv_temp.unlink(missing_ok=True)
             json_temp.unlink(missing_ok=True)
-
-    def _restore_published_file(self, path: Path, previous: bytes | None) -> None:
-        if previous is None:
-            path.unlink(missing_ok=True)
-            return
-        restore_temp = self._write_temp(path, previous)
-        try:
-            os.replace(restore_temp, path)
-        finally:
-            restore_temp.unlink(missing_ok=True)
 
     @staticmethod
     def _write_temp(path: Path, payload: bytes) -> Path:
