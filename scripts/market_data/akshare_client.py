@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 from urllib.error import URLError
 
 import pandas as pd
+from akshare.utils.demjson import JSONDecodeError
 
 try:  # Keep injected, offline test clients usable before dependencies are installed.
     import akshare as ak
@@ -161,15 +162,26 @@ class AkshareClient:
             raise ValueError(
                 f"{symbol!r} is not an eligible Shanghai or Shenzhen A-share symbol"
             )
-        frame = self._with_retry(
-            lambda: self._require_api().stock_zh_a_daily(
-                symbol=("sh" if symbol.startswith(SH_A_SHARE_PREFIXES) else "sz")
-                + symbol,
-                start_date=self._api_date(start),
-                end_date=self._api_date(end),
-                adjust="",
+        try:
+            frame = self._with_retry(
+                lambda: self._require_api().stock_zh_a_daily(
+                    symbol=("sh" if symbol.startswith(SH_A_SHARE_PREFIXES) else "sz")
+                    + symbol,
+                    start_date=self._api_date(start),
+                    end_date=self._api_date(end),
+                    adjust="",
+                )
             )
-        )
+        except JSONDecodeError:
+            frame = self._with_retry(
+                lambda: self._require_api().stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=self._api_date(start),
+                    end_date=self._api_date(end),
+                    adjust="",
+                )
+            )
         result = self._normalize(
             frame,
             {

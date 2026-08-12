@@ -2,6 +2,7 @@ from urllib.error import HTTPError
 
 import pandas as pd
 import pytest
+from akshare.utils.demjson import JSONDecodeError
 from requests.exceptions import ProxyError
 
 from scripts.market_data.akshare_client import (
@@ -241,6 +242,29 @@ def test_get_stock_history_uses_unadjusted_daily_prices_and_normalizes_columns()
     ]
     assert api.daily_history_request == {
         "symbol": "sh600000",
+        "start_date": "20250101",
+        "end_date": "20250103",
+        "adjust": "",
+    }
+
+
+def test_get_stock_history_falls_back_when_sina_returns_non_json_for_delisted_stock():
+    class DelistedStockApi(FakeAkshareApi):
+        def stock_zh_a_daily(self, **kwargs):
+            self.daily_history_request = kwargs
+            raise JSONDecodeError("No value to decode")
+
+    api = DelistedStockApi()
+
+    result = AkshareClient(api=api).get_stock_history(
+        "000004", "2025-01-01", "2025-01-03"
+    )
+
+    assert result["current_close"].tolist() == [10.0, 10.0, 10.0, 11.0]
+    assert api.daily_history_request["symbol"] == "sz000004"
+    assert api.history_request == {
+        "symbol": "000004",
+        "period": "daily",
         "start_date": "20250101",
         "end_date": "20250103",
         "adjust": "",
