@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
+import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
@@ -21,7 +23,7 @@ from .calculations import add_cumulative_diff, calculate_index_changes, classify
 HISTORY_START = date(2025, 1, 1)
 INDEX_LOOKBACK_DAYS = 31
 STOCK_HISTORY_START = date(1990, 12, 1)
-CHECKPOINT_NAMESPACE = "v2-akshare-unadjusted"
+CHECKPOINT_NAMESPACE = "v3-akshare-unadjusted"
 RECENT_VALID_COUNT_DAYS = 5
 MIN_VALID_COUNT_RATIO = 0.60
 MAX_MISSING_PRICE_OR_COMPARISON_RATIO = 0.20
@@ -95,10 +97,19 @@ class MarketDataPipeline:
         root: Path | str | None = None,
         client: Any | None = None,
         now: Callable[[], datetime] | None = None,
+        checkpoint_generation: str | None = None,
     ) -> None:
         self.root = Path(root) if root is not None else Path(__file__).resolve().parents[2]
         self.client = client if client is not None else AkshareClient()
         self.now = now if now is not None else lambda: datetime.now(timezone.utc)
+        self.checkpoint_generation = (
+            checkpoint_generation
+            or os.environ.get("MARKET_DATA_CHECKPOINT_GENERATION")
+        )
+        if self.checkpoint_generation is not None and not re.fullmatch(
+            r"[A-Za-z0-9._-]{1,128}", self.checkpoint_generation
+        ):
+            raise ValueError("checkpoint generation contains unsafe characters")
         self.csv_path = self.root / "data" / "market_history.csv"
         self.public_data_path = self.root / "public" / "data"
         self.manifest_path = self.public_data_path / "current.json"
@@ -106,6 +117,10 @@ class MarketDataPipeline:
     def run(self, as_of: date, full: bool = False) -> UpdateResult:
         if as_of < HISTORY_START:
             raise ValueError("as_of must be on or after 2025-01-01")
+        checkpoint_generation = self.checkpoint_generation or uuid.uuid4().hex
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", checkpoint_generation):
+            raise ValueError("checkpoint generation contains unsafe characters")
+        self._active_checkpoint_generation = checkpoint_generation
 
         existing = self._read_history()
         validate_history(existing)
@@ -140,15 +155,30 @@ class MarketDataPipeline:
         if not dates_to_update:
             return UpdateResult((), skipped=True)
 
-        replacements = self._collect_records(index_history, dates_to_update, as_of, existing)
+        refresh_start = (
+            HISTORY_START.isoformat() if full else min(dates_to_update)
+        )
+        self._prepare_checkpoint_generation(
+            full=full, as_of=as_of.isoformat(), refresh_start=refresh_start
+        )
+        replacements = self._collect_records(
+            index_history,
+            dates_to_update,
+            as_of,
+            existing,
+            full=full,
+            refresh_start=refresh_start,
+        )
         retained = existing.loc[~existing["date"].isin(dates_to_update)]
         combined = replacements if retained.empty else pd.concat([retained, replacements], ignore_index=True)
         combined = combined.loc[:, REQUIRED_COLUMNS].sort_values("date").reset_index(drop=True)
         combined = add_cumulative_diff(combined).loc[:, REQUIRED_COLUMNS]
         validate_history(combined)
         if self._history_csv_bytes(combined) == self._history_csv_bytes(existing):
+            self._mark_checkpoint_generation_successful()
             return UpdateResult((), skipped=True)
         self._atomic_publish(combined)
+        self._mark_checkpoint_generation_successful()
         return UpdateResult(tuple(dates_to_update))
 
     def _read_history(self) -> pd.DataFrame:
@@ -162,6 +192,7 @@ class MarketDataPipeline:
                 source = self.public_data_path / history_csv
             except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
                 raise MarketDataValidationError(f"cannot read current manifest: {error}") from error
+            self._reconcile_canonical(source)
         if not source.exists():
             return pd.DataFrame(columns=REQUIRED_COLUMNS)
         try:
@@ -197,6 +228,9 @@ class MarketDataPipeline:
         dates_to_update: list[str],
         as_of: date,
         existing: pd.DataFrame,
+        *,
+        full: bool,
+        refresh_start: str,
     ) -> pd.DataFrame:
         market = self.client.get_security_universe().copy()
         required_market_columns = {"symbol", "exchange", "listing_date", "delisting_date"}
@@ -218,7 +252,11 @@ class MarketDataPipeline:
         histories = []
         for symbol in market["symbol"]:
             history = self._stock_history(
-                symbol, history_start, as_of.isoformat()
+                symbol,
+                history_start,
+                as_of.isoformat(),
+                full=full,
+                refresh_start=refresh_start,
             ).copy()
             if not {"date", "current_close"}.issubset(history.columns):
                 raise MarketDataValidationError(f"stock history is incomplete for {symbol}")
@@ -309,31 +347,41 @@ class MarketDataPipeline:
             )
         return pd.DataFrame(records, columns=REQUIRED_COLUMNS)
 
-    def _stock_history(self, symbol: str, start: str, end: str) -> pd.DataFrame:
-        checkpoint_directory = self._checkpoint_directory(start, end) / symbol
-        cached = None
-        cached_end = None
-        for candidate in sorted(checkpoint_directory.glob("*.csv"), reverse=True):
+    def _stock_history(
+        self,
+        symbol: str,
+        start: str,
+        end: str,
+        *,
+        full: bool = False,
+        refresh_start: str | None = None,
+    ) -> pd.DataFrame:
+        checkpoint_root = self._checkpoint_directory(start, end)
+        generation_directory = (
+            checkpoint_root / "runs" / self._checkpoint_generation / "symbols"
+        )
+        generation_checkpoint = generation_directory / f"{symbol}.csv"
+        if generation_checkpoint.exists():
             try:
-                coverage_end = date.fromisoformat(candidate.stem).isoformat()
                 checkpoint = pd.read_csv(
-                    candidate,
+                    generation_checkpoint,
                     dtype={"date": str, "symbol": str},
                 )
-                cached = self._validated_stock_history(
-                    checkpoint, symbol, start, coverage_end
-                )
-                cached_end = coverage_end
-                break
+                return self._trim_stock_history(self._validated_stock_history(
+                    checkpoint, symbol, start, end
+                ))
             except (OSError, ValueError, pd.errors.ParserError):
-                candidate.unlink(missing_ok=True)
+                generation_checkpoint.unlink(missing_ok=True)
 
-        if cached is not None and cached_end is not None and cached_end >= end:
-            return cached.loc[cached["date"].between(start, end)].reset_index(drop=True)
-
-        request_start = start
-        if cached_end is not None:
-            request_start = (date.fromisoformat(cached_end) + timedelta(days=1)).isoformat()
+        successful = self._read_successful_checkpoint(
+            checkpoint_root, symbol, start, end
+        )
+        if full or successful is None:
+            request_start = start
+            prefix = None
+        else:
+            request_start = refresh_start or HISTORY_START.isoformat()
+            prefix = successful.loc[successful["date"] < request_start]
 
         history = self.client.get_stock_history(symbol, request_start, end).copy()
         history["symbol"] = symbol
@@ -352,22 +400,129 @@ class MarketDataPipeline:
         extension = self._validated_stock_history(history, symbol, request_start, end)
         checkpoint = (
             extension
-            if cached is None
-            else pd.concat([cached, extension], ignore_index=True)
+            if prefix is None
+            else pd.concat([prefix, extension], ignore_index=True)
         )
         checkpoint = self._validated_stock_history(checkpoint, symbol, start, end)
-        checkpoint_path = checkpoint_directory / f"{end}.csv"
+        checkpoint = self._trim_stock_history(checkpoint)
         payload = checkpoint.to_csv(index=False).encode("utf-8")
-        checkpoint_temp = self._write_temp(checkpoint_path, payload)
+        checkpoint_temp = self._write_temp(generation_checkpoint, payload)
         try:
-            os.replace(checkpoint_temp, checkpoint_path)
-            self._fsync_directory(checkpoint_path.parent)
+            os.replace(checkpoint_temp, generation_checkpoint)
+            self._fsync_directory(generation_checkpoint.parent)
         finally:
             checkpoint_temp.unlink(missing_ok=True)
-        for superseded in checkpoint_directory.glob("*.csv"):
-            if superseded != checkpoint_path:
-                superseded.unlink(missing_ok=True)
         return checkpoint.loc[checkpoint["date"].between(start, end)].reset_index(drop=True)
+
+    def _read_successful_checkpoint(
+        self, checkpoint_root: Path, symbol: str, start: str, end: str
+    ) -> pd.DataFrame | None:
+        pointer_path = checkpoint_root / "latest-success.json"
+        try:
+            pointer = json.loads(pointer_path.read_text(encoding="utf-8"))
+            generation = pointer["generation"]
+            if not isinstance(generation, str) or not re.fullmatch(
+                r"[A-Za-z0-9._-]{1,128}", generation
+            ):
+                raise ValueError("invalid successful checkpoint generation")
+            checkpoint_path = (
+                checkpoint_root / "runs" / generation / "symbols" / f"{symbol}.csv"
+            )
+            checkpoint = pd.read_csv(
+                checkpoint_path, dtype={"date": str, "symbol": str}
+            )
+            return self._trim_stock_history(
+                self._validated_stock_history(checkpoint, symbol, start, end)
+            )
+        except (
+            FileNotFoundError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+            pd.errors.ParserError,
+        ):
+            return None
+
+    @staticmethod
+    def _trim_stock_history(frame: pd.DataFrame) -> pd.DataFrame:
+        window_start = HISTORY_START.isoformat()
+        before_window = frame.loc[
+            (frame["date"] < window_start)
+            & frame["current_close"].gt(0)
+            & ~frame["is_suspended"].fillna(False)
+        ].tail(1)
+        in_window = frame.loc[frame["date"] >= window_start]
+        return pd.concat([before_window, in_window], ignore_index=True)
+
+    def _prepare_checkpoint_generation(
+        self, *, full: bool, as_of: str, refresh_start: str
+    ) -> None:
+        checkpoint_root = self._checkpoint_directory(
+            STOCK_HISTORY_START.isoformat(), ""
+        )
+        metadata_path = (
+            checkpoint_root / "runs" / self._checkpoint_generation / "run.json"
+        )
+        metadata = {
+            "schema": 1,
+            "generation": self._checkpoint_generation,
+            "mode": "full" if full else "routine",
+            "as_of": as_of,
+            "history_start": STOCK_HISTORY_START.isoformat(),
+            "refresh_start": refresh_start,
+        }
+        if metadata_path.exists():
+            try:
+                existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise MarketDataValidationError(
+                    f"cannot read checkpoint generation metadata: {error}"
+                ) from error
+            if existing != metadata:
+                raise MarketDataValidationError(
+                    "checkpoint generation metadata does not match this run"
+                )
+            return
+        metadata_bytes = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+        metadata_temp = self._write_temp(metadata_path, metadata_bytes)
+        try:
+            os.replace(metadata_temp, metadata_path)
+            self._fsync_directory(metadata_path.parent)
+        finally:
+            metadata_temp.unlink(missing_ok=True)
+
+    def _mark_checkpoint_generation_successful(self) -> None:
+        checkpoint_root = self._checkpoint_directory(
+            STOCK_HISTORY_START.isoformat(), ""
+        )
+        pointer_path = checkpoint_root / "latest-success.json"
+        pointer_bytes = json.dumps(
+            {"schema": 1, "generation": self._checkpoint_generation},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        pointer_temp = self._write_temp(pointer_path, pointer_bytes)
+        try:
+            os.replace(pointer_temp, pointer_path)
+            self._fsync_directory(pointer_path.parent)
+        finally:
+            pointer_temp.unlink(missing_ok=True)
+        runs_directory = checkpoint_root / "runs"
+        for generation_directory in runs_directory.iterdir():
+            if (
+                generation_directory.is_dir()
+                and generation_directory.name != self._checkpoint_generation
+            ):
+                shutil.rmtree(generation_directory)
+
+    @property
+    def _checkpoint_generation(self) -> str:
+        generation = getattr(self, "_active_checkpoint_generation", None)
+        if generation is None:
+            generation = self.checkpoint_generation or uuid.uuid4().hex
+            self._active_checkpoint_generation = generation
+        return generation
 
     @staticmethod
     def _validated_stock_history(
@@ -466,18 +621,10 @@ class MarketDataPipeline:
         json_path = version_path / "market_history.json"
         csv_temp = self._write_temp(csv_path, csv_bytes)
         json_temp = self._write_temp(json_path, json_bytes)
-        canonical_temp = self._write_temp(self.csv_path, csv_bytes)
-        previous_canonical = (
-            self.csv_path.read_bytes() if self.csv_path.exists() else None
-        )
-        canonical_switched = False
         try:
             os.replace(csv_temp, csv_path)
             os.replace(json_temp, json_path)
             self._fsync_directory(version_path)
-            os.replace(canonical_temp, self.csv_path)
-            canonical_switched = True
-            self._fsync_directory(self.csv_path.parent)
             generated_at = self.now().astimezone(timezone.utc).replace(microsecond=0)
             manifest = {
                 "version": version,
@@ -490,25 +637,53 @@ class MarketDataPipeline:
             try:
                 os.replace(manifest_temp, self.manifest_path)
                 self._fsync_directory(self.public_data_path)
+                self._reconcile_canonical(csv_path)
             finally:
                 manifest_temp.unlink(missing_ok=True)
         except Exception:
-            if canonical_switched:
-                if previous_canonical is None:
-                    self.csv_path.unlink(missing_ok=True)
-                else:
-                    rollback_temp = self._write_temp(
-                        self.csv_path, previous_canonical
-                    )
-                    try:
-                        os.replace(rollback_temp, self.csv_path)
-                        self._fsync_directory(self.csv_path.parent)
-                    finally:
-                        rollback_temp.unlink(missing_ok=True)
+            try:
+                self._reconcile_canonical_from_manifest()
+            except Exception:
+                # The manifest is the single live pointer. A later run repairs
+                # this derived mirror if the best-effort write cannot finish.
+                pass
             raise
         finally:
             csv_temp.unlink(missing_ok=True)
             json_temp.unlink(missing_ok=True)
+
+    def _reconcile_canonical_from_manifest(self) -> None:
+        try:
+            manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            history_csv = manifest.get("history_csv", manifest.get("csv"))
+            if not isinstance(history_csv, str):
+                raise KeyError("history_csv")
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+            raise MarketDataValidationError(f"cannot read current manifest: {error}") from error
+        self._reconcile_canonical(self.public_data_path / history_csv)
+
+    def _reconcile_canonical(self, active_csv: Path) -> None:
+        try:
+            active_bytes = active_csv.read_bytes()
+        except OSError as error:
+            raise MarketDataValidationError(
+                f"cannot read active history CSV: {error}"
+            ) from error
+        try:
+            canonical_bytes = self.csv_path.read_bytes()
+        except FileNotFoundError:
+            canonical_bytes = None
+        except OSError as error:
+            raise MarketDataValidationError(
+                f"cannot read canonical history CSV: {error}"
+            ) from error
+        if canonical_bytes == active_bytes:
+            return
+        canonical_temp = self._write_temp(self.csv_path, active_bytes)
+        try:
+            os.replace(canonical_temp, self.csv_path)
+            self._fsync_directory(self.csv_path.parent)
+        finally:
             canonical_temp.unlink(missing_ok=True)
 
     @staticmethod

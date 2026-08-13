@@ -4,16 +4,16 @@
 
 **Goal:** Make full AKShare history collection resume after interruption without publishing partial data.
 
-**Architecture:** `MarketDataPipeline` stores validated, end-dated CSV checkpoints per symbol under an ignored, source-versioned namespace. Reads validate the cached schema and coverage, writes are atomic, and later runs extend only the uncovered tail.
+**Architecture:** `MarketDataPipeline` stores validated per-symbol CSV checkpoints under an ignored, source-versioned run generation. Same-generation retries reuse completed symbols, new full generations refetch history, and routine generations refresh at least five overlapping trading dates. Persisted rows are bounded to one pre-window baseline plus the statistics window.
 
 **Tech Stack:** Python 3.9+, pandas, pytest, filesystem atomic replace.
 
 ## Global Constraints
 
-- Checkpoints live only below `work/market-data-checkpoints/v2-akshare-unadjusted/<baseline>/<symbol>/`.
+- Checkpoints live only below `work/market-data-checkpoints/v3-akshare-unadjusted/<baseline>/runs/<generation>/`.
 - Partial histories must never be copied into `data/` or `public/data/`.
 - Existing canonical manifest keys are `history_json` and `history_csv`; old keys remain read-compatible only.
-- Successful and failed runs preserve valid completed-symbol checkpoints for reuse.
+- Only retries of the same generation treat completed symbols as authoritative; later generations apply explicit full or routine freshness rules.
 
 ---
 
@@ -47,7 +47,7 @@ Run: `python3 -m pytest tests/data/test_pipeline.py::test_full_run_resumes_compl
 
 Expected: PASS.
 
-### Task 2: Reuse checkpoints across later publication dates
+### Task 2: Refresh checkpoints across later publication dates
 
 **Files:**
 - Modify: `scripts/market_data/pipeline.py`
@@ -55,21 +55,21 @@ Expected: PASS.
 
 **Interfaces:**
 - Consumes: the source-versioned per-symbol checkpoints created in Task 1.
-- Produces: successful `run(...)` that retains checkpoints and fetches only an uncovered tail on a later `as_of` date.
+- Produces: successful `run(...)` that refetches full history for full mode or an overlapping five-trading-day tail for routine mode.
 
-- [ ] **Step 1: Write a failing incremental-reuse test**
+- [ ] **Step 1: Write failing full and routine revision tests**
 
-Run a full fixture update, advance `as_of`, and assert the next stock request begins one day after the prior checkpoint's covered end.
+Publish a fixture, revise an upstream old close, and assert a new full generation and a routine overlap refresh each observe the correction.
 
-- [ ] **Step 2: Verify the test fails because the old range cache cannot extend**
+- [ ] **Step 2: Verify the tests fail because old checkpoints remain authoritative**
 
-Run: `python3 -m pytest tests/data/test_pipeline.py::test_successful_publish_keeps_checkpoint_for_later_as_of -v`
+Run: `python3 -m pytest tests/data/test_pipeline.py::test_new_full_generation_refetches_history_and_applies_revision tests/data/test_pipeline.py::test_routine_generation_refreshes_recent_five_dates_and_applies_revision -v`
 
-Expected: FAIL because the old implementation refetches the full range.
+Expected: FAIL because the old implementation does not refetch cached dates.
 
-- [ ] **Step 3: Implement source-versioned coverage checkpoints**
+- [ ] **Step 3: Implement source-versioned generation checkpoints**
 
-Select the newest valid checkpoint, fetch only the uncovered tail, merge and validate it, then atomically write the new end-dated checkpoint. Retain it after publication.
+Write immutable run metadata, reuse only the same incomplete generation, and advance a latest-success pointer after publication/no-change validation. Full generations refetch all; routine generations replace the overlapping refresh interval. Trim every symbol to one valid pre-window baseline plus window rows before persistence and aggregation.
 
 - [ ] **Step 4: Verify incremental reuse and all data tests**
 

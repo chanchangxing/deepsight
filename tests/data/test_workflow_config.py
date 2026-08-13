@@ -32,7 +32,7 @@ def test_workflow_restores_and_always_saves_cross_runner_checkpoints():
     )
 
     checkpoint_path = "work/market-data-checkpoints"
-    stable_prefix = "market-data-checkpoints-v2-akshare-unadjusted-${{ runner.os }}-"
+    stable_prefix = "market-data-checkpoints-v3-akshare-unadjusted-${{ runner.os }}-"
     assert restore_index < update_index < save_index
     assert restore["id"] == "checkpoint_cache"
     assert restore["with"]["path"] == checkpoint_path
@@ -45,3 +45,16 @@ def test_workflow_restores_and_always_saves_cross_runner_checkpoints():
         "path": checkpoint_path,
         "key": "${{ steps.checkpoint_cache.outputs.cache-primary-key }}",
     }
+
+
+def test_workflow_reuses_one_checkpoint_generation_across_run_attempts():
+    workflow = yaml.safe_load(Path(".github/workflows/update-data.yml").read_text())
+    update = next(
+        step
+        for step in workflow["jobs"]["update"]["steps"]
+        if step.get("name") == "Update market data"
+    )
+
+    assert update["env"]["MARKET_DATA_CHECKPOINT_GENERATION"] == (
+        "${{ github.run_id }}"
+    )

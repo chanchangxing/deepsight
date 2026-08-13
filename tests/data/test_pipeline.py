@@ -169,6 +169,39 @@ class RangeAwareHistoryClient(FixtureClient):
         return history.loc[history["date"].between(start, end)].reset_index(drop=True)
 
 
+class RevisableHistoryClient(RangeAwareHistoryClient):
+    def __init__(self):
+        super().__init__()
+        self.revisions = {}
+
+    def get_stock_history(self, symbol, start, end):
+        history = super().get_stock_history(symbol, start, end).copy()
+        for (revision_symbol, revision_date), close in self.revisions.items():
+            if revision_symbol == symbol:
+                history.loc[history["date"] == revision_date, "current_close"] = close
+        return history
+
+
+class DecadesHistoryClient:
+    def __init__(self, symbol_count=1):
+        self.symbol_count = symbol_count
+        self.history_requests = []
+
+    def get_stock_history(self, symbol, start, end):
+        self.history_requests.append((symbol, start, end))
+        old_dates = pd.date_range("1991-01-02", "2024-12-31", freq="B")
+        window_dates = pd.date_range("2025-01-02", "2025-01-31", freq="B")
+        dates = old_dates.append(window_dates)
+        return pd.DataFrame(
+            {
+                "date": dates.strftime("%Y-%m-%d"),
+                "symbol": [symbol] * len(dates),
+                "current_close": [10.0] * len(dates),
+                "is_suspended": [False] * len(dates),
+            }
+        )
+
+
 class CrossYearSuspensionClient(FixtureClient):
     def get_stock_history(self, symbol, start, end):
         self.history_requests.append((symbol, start, end))
@@ -248,11 +281,14 @@ class ProductionShapeFixtureClient(FixtureClient):
         return self.history_client.get_stock_history(symbol, start, end)
 
 
-def make_pipeline(tmp_path: Path, client=None, now=None) -> MarketDataPipeline:
+def make_pipeline(
+    tmp_path: Path, client=None, now=None, checkpoint_generation=None
+) -> MarketDataPipeline:
     return MarketDataPipeline(
         root=tmp_path,
         client=client or FixtureClient(),
         now=now,
+        checkpoint_generation=checkpoint_generation,
     )
 
 
@@ -302,21 +338,39 @@ def test_full_run_resumes_completed_stock_history_after_failure(tmp_path):
     client = FailsOnceDuringStockHistoryClient()
 
     with pytest.raises(RuntimeError, match="simulated interrupted"):
-        make_pipeline(tmp_path, client).run(date(2025, 1, 6), full=True)
+        make_pipeline(
+            tmp_path, client, checkpoint_generation="full-attempt-1"
+        ).run(date(2025, 1, 6), full=True)
 
-    make_pipeline(tmp_path, client).run(date(2025, 1, 6), full=True)
+    metadata_path = (
+        tmp_path
+        / "work/market-data-checkpoints/v3-akshare-unadjusted"
+        / "1990-12-01/runs/full-attempt-1/run.json"
+    )
+    assert json.loads(metadata_path.read_text()) == {
+        "schema": 1,
+        "generation": "full-attempt-1",
+        "mode": "full",
+        "as_of": "2025-01-06",
+        "history_start": "1990-12-01",
+        "refresh_start": "2025-01-01",
+    }
+
+    make_pipeline(tmp_path, client, checkpoint_generation="full-attempt-1").run(
+        date(2025, 1, 6), full=True
+    )
 
     requested_symbols = [symbol for symbol, _, _ in client.history_requests]
     assert requested_symbols.count("600000") == 1
     assert requested_symbols.count("000001") == 2
 
 
-def test_stock_checkpoint_extends_only_the_uncovered_end_range(tmp_path):
+def test_stock_checkpoint_reuses_a_completed_symbol_within_one_generation(tmp_path):
     client = RangeAwareHistoryClient()
     pipeline = make_pipeline(tmp_path, client)
 
     first = pipeline._stock_history("600000", "2024-12-31", "2025-01-06")
-    second = pipeline._stock_history("600000", "2024-12-31", "2025-01-07")
+    second = pipeline._stock_history("600000", "2024-12-31", "2025-01-06")
 
     assert first["date"].tolist() == [
         "2024-12-31",
@@ -324,28 +378,120 @@ def test_stock_checkpoint_extends_only_the_uncovered_end_range(tmp_path):
         "2025-01-03",
         "2025-01-06",
     ]
-    assert second["date"].tolist() == [
+    assert second.equals(first)
+    assert client.history_requests == [("600000", "2024-12-31", "2025-01-06")]
+
+
+def test_decades_response_retains_only_one_baseline_plus_window_rows(tmp_path):
+    client = DecadesHistoryClient()
+    pipeline = make_pipeline(
+        tmp_path, client, checkpoint_generation="bounded-generation"
+    )
+
+    history = pipeline._stock_history(
+        "600000", "1990-12-01", "2025-01-31", full=True
+    )
+
+    assert history["date"].tolist() == [
         "2024-12-31",
-        "2025-01-02",
-        "2025-01-03",
-        "2025-01-06",
-        "2025-01-07",
+        *pd.date_range("2025-01-02", "2025-01-31", freq="B").strftime("%Y-%m-%d"),
     ]
-    assert client.history_requests == [
-        ("600000", "2024-12-31", "2025-01-06"),
-        ("600000", "2025-01-07", "2025-01-07"),
-    ]
+    checkpoint = pd.read_csv(
+        tmp_path
+        / "work/market-data-checkpoints/v3-akshare-unadjusted"
+        / "1990-12-01/runs/bounded-generation/symbols/600000.csv"
+    )
+    assert checkpoint["date"].tolist() == history["date"].tolist()
 
 
-def test_successful_publish_keeps_checkpoint_for_incremental_next_as_of(tmp_path):
-    client = RangeAwareHistoryClient()
-    pipeline = make_pipeline(tmp_path, client)
-    pipeline.run(date(2025, 1, 6), full=True)
+def test_synthetic_checkpoint_rows_scale_with_window_not_listing_age(tmp_path):
+    client = DecadesHistoryClient(symbol_count=120)
+    pipeline = make_pipeline(
+        tmp_path, client, checkpoint_generation="scale-generation"
+    )
 
-    pipeline.run(date(2025, 1, 7), full=True)
+    retained_rows = 0
+    for value in range(client.symbol_count):
+        symbol = f"6{value:05d}"
+        retained_rows += len(
+            pipeline._stock_history(
+                symbol, "1990-12-01", "2025-01-31", full=True
+            )
+        )
 
-    assert ("600000", "2025-01-07", "2025-01-07") in client.history_requests
-    assert ("000001", "2025-01-07", "2025-01-07") in client.history_requests
+    january_rows = len(pd.date_range("2025-01-02", "2025-01-31", freq="B"))
+    assert retained_rows <= client.symbol_count * (january_rows + 1)
+
+
+def test_successful_generation_prunes_superseded_checkpoint_rows(tmp_path):
+    client = DecadesHistoryClient(symbol_count=10)
+    for generation in ("old-generation", "current-generation"):
+        pipeline = make_pipeline(
+            tmp_path, client, checkpoint_generation=generation
+        )
+        pipeline._prepare_checkpoint_generation(
+            full=True, as_of="2025-01-31", refresh_start="2025-01-01"
+        )
+        for value in range(client.symbol_count):
+            pipeline._stock_history(
+                f"6{value:05d}", "1990-12-01", "2025-01-31", full=True
+            )
+        pipeline._mark_checkpoint_generation_successful()
+
+    runs = (
+        tmp_path
+        / "work/market-data-checkpoints/v3-akshare-unadjusted"
+        / "1990-12-01/runs"
+    )
+    assert [path.name for path in runs.iterdir()] == ["current-generation"]
+    checkpoint_rows = sum(
+        len(pd.read_csv(path)) for path in runs.rglob("symbols/*.csv")
+    )
+    january_rows = len(pd.date_range("2025-01-02", "2025-01-31", freq="B"))
+    assert checkpoint_rows <= client.symbol_count * (january_rows + 1)
+
+
+def test_new_full_generation_refetches_history_and_applies_revision(tmp_path):
+    client = RevisableHistoryClient()
+    make_pipeline(tmp_path, client, checkpoint_generation="full-generation-a").run(
+        date(2025, 1, 10), full=True
+    )
+    before_requests = len(client.history_requests)
+    client.revisions[("600000", "2025-01-03")] = 8.0
+
+    make_pipeline(tmp_path, client, checkpoint_generation="full-generation-b").run(
+        date(2025, 1, 10), full=True
+    )
+
+    new_requests = client.history_requests[before_requests:]
+    assert ("600000", "1990-12-01", "2025-01-10") in new_requests
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["history_csv"])
+    revised = frame.loc[frame["date"] == "2025-01-03"].iloc[0]
+    assert revised["down_count"] == 2
+    assert revised["daily_diff"] == -2
+
+
+def test_routine_generation_refreshes_recent_five_dates_and_applies_revision(tmp_path):
+    client = RevisableHistoryClient()
+    make_pipeline(tmp_path, client, checkpoint_generation="full-generation").run(
+        date(2025, 1, 10), full=True
+    )
+    before_requests = len(client.history_requests)
+    client.revisions[("600000", "2025-01-08")] = 9.0
+
+    make_pipeline(tmp_path, client, checkpoint_generation="routine-generation").run(
+        date(2025, 1, 13)
+    )
+
+    new_requests = client.history_requests[before_requests:]
+    assert ("600000", "2025-01-07", "2025-01-13") in new_requests
+    assert ("000001", "2025-01-07", "2025-01-13") in new_requests
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    frame = pd.read_csv(tmp_path / "public/data" / manifest["history_csv"])
+    revised = frame.loc[frame["date"] == "2025-01-08"].iloc[0]
+    assert revised["down_count"] == 2
+    assert revised["daily_diff"] == -2
 
 
 def test_rerun_replaces_date_and_rebuilds_cumulative(tmp_path):
@@ -487,6 +633,106 @@ def test_manifest_switch_failure_rolls_back_canonical_csv(tmp_path, monkeypatch)
 
     assert manifest_path.read_bytes() == before_manifest
     assert canonical_path.read_bytes() == before_canonical
+
+
+def test_post_manifest_fsync_failure_keeps_canonical_aligned_with_active_version(
+    tmp_path, monkeypatch
+):
+    make_pipeline(tmp_path).run(date(2025, 1, 6))
+    manifest_path = tmp_path / "public/data/current.json"
+    canonical_path = tmp_path / "data/market_history.csv"
+    before_manifest = manifest_path.read_bytes()
+    original_fsync_directory = MarketDataPipeline._fsync_directory
+    manifest_switched = False
+
+    def fail_after_manifest_switch(path):
+        nonlocal manifest_switched
+        if Path(path) == tmp_path / "public/data":
+            manifest_switched = True
+            raise OSError("simulated public data fsync failure")
+        return original_fsync_directory(path)
+
+    monkeypatch.setattr(
+        MarketDataPipeline, "_fsync_directory", staticmethod(fail_after_manifest_switch)
+    )
+
+    with pytest.raises(OSError, match="simulated public data fsync failure"):
+        make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(
+            date(2025, 1, 7), full=True
+        )
+
+    assert manifest_switched is True
+    assert manifest_path.read_bytes() != before_manifest
+    manifest = json.loads(manifest_path.read_text())
+    active_csv = tmp_path / "public/data" / manifest["history_csv"]
+    assert canonical_path.read_bytes() == active_csv.read_bytes()
+
+
+def test_new_pipeline_reconciles_canonical_from_active_manifest(tmp_path):
+    pipeline = make_pipeline(tmp_path)
+    pipeline.run(date(2025, 1, 6))
+    canonical_path = tmp_path / "data/market_history.csv"
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    active_csv = tmp_path / "public/data" / manifest["history_csv"]
+    canonical_path.write_text("interrupted canonical bytes\n", encoding="utf-8")
+
+    make_pipeline(tmp_path)._read_history()
+
+    assert canonical_path.read_bytes() == active_csv.read_bytes()
+
+
+@pytest.mark.parametrize("visible_manifest", ["old", "new"])
+def test_restart_reconciles_to_whichever_manifest_is_visible(
+    tmp_path, visible_manifest
+):
+    first = make_pipeline(tmp_path)
+    first.run(date(2025, 1, 6))
+    manifest_path = tmp_path / "public/data/current.json"
+    canonical_path = tmp_path / "data/market_history.csv"
+    old_manifest_bytes = manifest_path.read_bytes()
+    old_manifest = json.loads(old_manifest_bytes)
+    old_csv = (tmp_path / "public/data" / old_manifest["history_csv"]).read_bytes()
+
+    make_pipeline(tmp_path, FixtureClient(close_delta=5.0)).run(
+        date(2025, 1, 7), full=True
+    )
+    new_manifest_bytes = manifest_path.read_bytes()
+    new_manifest = json.loads(new_manifest_bytes)
+    new_csv = (tmp_path / "public/data" / new_manifest["history_csv"]).read_bytes()
+
+    if visible_manifest == "old":
+        manifest_path.write_bytes(old_manifest_bytes)
+        canonical_path.write_bytes(new_csv)
+        expected_csv = old_csv
+    else:
+        canonical_path.write_bytes(old_csv)
+        expected_csv = new_csv
+
+    class StopsAfterStartup(FixtureClient):
+        def get_index_history(self, start, end):
+            raise RuntimeError("stop after startup")
+
+    with pytest.raises(RuntimeError, match="stop after startup"):
+        make_pipeline(tmp_path, StopsAfterStartup()).run(date(2025, 1, 7))
+
+    assert canonical_path.read_bytes() == expected_csv
+
+
+def test_routine_early_no_op_reconciles_canonical_before_return(tmp_path):
+    client = FixtureClient()
+    pipeline = make_pipeline(tmp_path, client)
+    pipeline.run(date(2025, 1, 6))
+    canonical_path = tmp_path / "data/market_history.csv"
+    manifest = json.loads((tmp_path / "public/data/current.json").read_text())
+    active_csv = tmp_path / "public/data" / manifest["history_csv"]
+    canonical_path.write_text("interrupted canonical bytes\n", encoding="utf-8")
+    before_requests = list(client.history_requests)
+
+    result = make_pipeline(tmp_path, client).run(date(2025, 1, 6))
+
+    assert result.skipped is True
+    assert client.history_requests == before_requests
+    assert canonical_path.read_bytes() == active_csv.read_bytes()
 
 
 def test_rejects_existing_dates_that_are_not_index_trading_days(tmp_path):
