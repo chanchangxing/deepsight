@@ -285,12 +285,16 @@ class MarketDataPipeline:
         history_start = STOCK_HISTORY_START.isoformat()
         histories = []
         failures = []
-        for symbol in market["symbol"]:
+        for security in market.itertuples(index=False):
+            symbol = security.symbol
+            history_end = as_of.isoformat()
+            if pd.notna(security.delisting_date):
+                history_end = min(history_end, security.delisting_date)
             try:
                 history = self._stock_history(
                     symbol,
                     history_start,
-                    as_of.isoformat(),
+                    history_end,
                     full=full,
                     refresh_start=refresh_start,
                 ).copy()
@@ -307,7 +311,7 @@ class MarketDataPipeline:
             except (RuntimeError, ValueError) as error:
                 failures.append(symbol)
                 self._record_failure(
-                    "stock_history", symbol, history_start, as_of.isoformat(), error
+                    "stock_history", symbol, history_start, history_end, error
                 )
         if failures:
             raise MarketDataUnavailable(
@@ -438,9 +442,15 @@ class MarketDataPipeline:
                     )
                 return checkpoint
 
+        ended_before_refresh = refresh_start is not None and refresh_start > end
         successful = self._read_successful_checkpoint(
-            checkpoint_root, symbol, start, end
+            checkpoint_root, symbol, start, end, exact_end=ended_before_refresh
         )
+        if not full and ended_before_refresh and successful is not None:
+            # An already completed lifecycle needs no empty post-delisting fetch.
+            # Require exact coverage, the current source version and a valid hash.
+            self._save_symbol_checkpoint(generation_checkpoint, successful, start, end)
+            return successful
         if full or successful is None:
             request_start = start
             prefix = None
@@ -476,7 +486,13 @@ class MarketDataPipeline:
         )
 
     def _read_successful_checkpoint(
-        self, checkpoint_root: Path, symbol: str, start: str, end: str
+        self,
+        checkpoint_root: Path,
+        symbol: str,
+        start: str,
+        end: str,
+        *,
+        exact_end: bool = False,
     ) -> pd.DataFrame | None:
         pointer_path = checkpoint_root / "latest-success.json"
         try:
@@ -489,7 +505,9 @@ class MarketDataPipeline:
             checkpoint_path = (
                 checkpoint_root / "runs" / generation / "symbols" / f"{symbol}.csv"
             )
-            return self._read_symbol_checkpoint(checkpoint_path, symbol, start, end)
+            return self._read_symbol_checkpoint(
+                checkpoint_path, symbol, start, end, exact_end=exact_end
+            )
         except (
             FileNotFoundError,
             KeyError,

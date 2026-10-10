@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import socket
 import time
 from collections.abc import Callable
@@ -21,7 +22,7 @@ except ImportError:  # pragma: no cover - production installs this from requirem
 
 
 LOGGER = logging.getLogger(__name__)
-SOURCE_CONTRACT = "unadjusted-v2"
+SOURCE_CONTRACT = "unadjusted-v3"
 T = TypeVar("T")
 TRANSIENT_ERRORS = (TimeoutError, ConnectionError, socket.timeout, URLError)
 SH_A_SHARE_PREFIXES = ("600", "601", "603", "605", "688")
@@ -48,10 +49,16 @@ class AkshareClient:
         api: Any = ak,
         sleeper: Callable[[float], None] = time.sleep,
         delays: tuple[int, ...] = (30, 90, 180),
+        sina_price_history: Callable[[str, str, str], pd.DataFrame] | None = None,
     ) -> None:
         self.api = api
         self.sleeper = sleeper
         self.delays = delays
+        # Keep fake APIs offline; production can recover prices without the
+        # optional circulating-share endpoint used inside stock_zh_a_daily.
+        self.sina_price_history = sina_price_history or (
+            self._sina_price_history if api is ak and api is not None else None
+        )
 
     @property
     def cache_version(self) -> str:
@@ -80,6 +87,10 @@ class AkshareClient:
             except Exception as error:
                 if not (
                     self._is_transient_error(error)
+                    or (
+                        error.__class__.__module__.startswith("requests")
+                        and error.__class__.__name__ == "HTTPError"
+                    )
                     or isinstance(
                         error,
                         (
@@ -333,38 +344,104 @@ class AkshareClient:
             result["is_suspended"] = result["volume"].eq(0) & result["amount"].eq(0)
             return result
 
+        exchange_symbol = (
+            "sh" if symbol.startswith(SH_A_SHARE_PREFIXES) else "sz"
+        ) + symbol
+        sources = [
+            (
+                "sina.daily",
+                lambda: self._require_api().stock_zh_a_daily(
+                    symbol=exchange_symbol,
+                    start_date=self._api_date(start),
+                    end_date=self._api_date(end),
+                    adjust="",
+                ),
+            ),
+        ]
+        if self.sina_price_history is not None:
+            sources.append(
+                (
+                    "sina.prices",
+                    lambda: self.sina_price_history(exchange_symbol, start, end),
+                )
+            )
+        sources.append(
+            (
+                "eastmoney.hist",
+                lambda: self._require_api().stock_zh_a_hist(
+                    symbol=symbol,
+                    period="daily",
+                    start_date=self._api_date(start),
+                    end_date=self._api_date(end),
+                    adjust="",
+                    timeout=20,
+                ),
+            )
+        )
         return self._from_sources(
-            [
-                (
-                    "sina.daily",
-                    lambda: self._require_api().stock_zh_a_daily(
-                        symbol=(
-                            "sh" if symbol.startswith(SH_A_SHARE_PREFIXES) else "sz"
-                        )
-                        + symbol,
-                        start_date=self._api_date(start),
-                        end_date=self._api_date(end),
-                        adjust="",
-                    ),
-                ),
-                (
-                    "eastmoney.hist",
-                    lambda: self._require_api().stock_zh_a_hist(
-                        symbol=symbol,
-                        period="daily",
-                        start_date=self._api_date(start),
-                        end_date=self._api_date(end),
-                        adjust="",
-                        timeout=20,
-                    ),
-                ),
-            ],
+            sources,
             normalize=normalize,
             stage="stock_history",
             symbol=symbol,
             start=start,
             end=end,
         )
+
+    @staticmethod
+    def _sina_price_history(symbol: str, start: str, end: str) -> pd.DataFrame:
+        """Read the same unadjusted price payload without querying share capital.
+
+        AKShare's daily endpoint also computes turnover using an auxiliary
+        share-capital response. That response can be null for delisted stocks
+        although their price history is still present. Breadth needs only the
+        dated close, volume and amount already carried in this payload.
+        """
+        import py_mini_racer
+        import requests
+        from akshare.stock.cons import hk_js_decode, zh_sina_a_stock_hist_url
+
+        response = requests.get(zh_sina_a_stock_hist_url.format(symbol), timeout=20)
+        response.raise_for_status()
+        match = re.fullmatch(
+            rf'\s*var\s+KLC_K2_{re.escape(symbol)}\s*=\s*"([A-Za-z0-9+/=]+)";?'
+            r"(?:\s*/\*(?:(?!\*/)[\s\S])*\*/)*\s*",
+            response.text,
+        )
+        if match is None:
+            raise MarketDataSchemaError("invalid Sina price assignment or symbol")
+        decoder = py_mini_racer.MiniRacer()
+        try:
+            # Evaluate only AKShare's bundled decoder, never the HTTP response.
+            decoder.eval(hk_js_decode)
+            rows = decoder.call("d", match.group(1))
+        except py_mini_racer.JSEvalException as error:
+            raise MarketDataSchemaError("cannot decode Sina prices") from error
+        if (
+            not isinstance(rows, list)
+            or not rows
+            or not all(isinstance(row, dict) for row in rows)
+        ):
+            raise MarketDataSchemaError("Sina prices are not a nonempty row list")
+        frame = AkshareClient._normalize(
+            pd.DataFrame(rows),
+            {
+                "date": ("date",),
+                "close": ("close",),
+                "volume": ("volume",),
+                "amount": ("amount",),
+            },
+            numeric_columns=("close", "volume", "amount"),
+        )
+        if (
+            frame.isna().any().any()
+            or frame.isin([float("inf"), float("-inf")]).any().any()
+            or frame["date"].duplicated().any()
+        ):
+            raise MarketDataSchemaError("invalid or duplicate Sina price rows")
+        frame["close"] = frame["close"].round(2)
+        # Do not forward-fill, manufacture post-delisting prices, or collapse
+        # distinct dates when OHLC and turnover happen to be unchanged.
+        return frame.loc[frame["date"].between(start, end)].reset_index(drop=True)
 
     def _normalize_market(self, frame: pd.DataFrame, exchange: str) -> pd.DataFrame:
         result = self._normalize(

@@ -1039,3 +1039,75 @@ def test_expired_retry_of_same_generation_refetches_completed_prices(tmp_path):
         checkpoint_generation="same-run",
     ).run(date(2025, 1, 6), full=True)
     assert [symbol for symbol, _, _ in client.history_requests].count("600000") == 2
+
+
+def test_delisted_history_request_ends_at_lifecycle_boundary(tmp_path):
+    client = RangeAwareHistoryClient(include_delisted=True)
+    make_pipeline(tmp_path, client).run(date(2025, 1, 8), full=True)
+    assert ("600999", "1990-12-01", "2025-01-07") in client.history_requests
+
+
+@pytest.mark.parametrize("full", [False, True])
+def test_finished_lifecycle_requires_exact_success_cache_or_full_fetch(tmp_path, full):
+    client = RangeAwareHistoryClient(include_delisted=True)
+    pipeline = make_pipeline(tmp_path, client, checkpoint_generation="first")
+    pipeline.run(date(2025, 1, 8), full=True)
+    client.history_requests.clear()
+    next_pipeline = make_pipeline(tmp_path, client, checkpoint_generation="next")
+    history = next_pipeline._stock_history(
+        "600999",
+        "1990-12-01",
+        "2025-01-07",
+        full=full,
+        refresh_start="2025-01-08",
+    )
+    assert history["date"].max() == "2025-01-07"
+    assert client.history_requests == (
+        [("600999", "1990-12-01", "2025-01-07")] if full else []
+    )
+    # Live stocks must still refresh their recent window.
+    next_pipeline._stock_history(
+        "600000",
+        "1990-12-01",
+        "2025-01-09",
+        refresh_start="2025-01-08",
+    )
+    assert client.history_requests[-1] == ("600000", "2025-01-08", "2025-01-09")
+
+
+@pytest.mark.parametrize("cache_state", ["missing", "shorter", "corrupt"])
+def test_finished_lifecycle_without_complete_cache_refetches_history(
+    tmp_path, cache_state
+):
+    client = RangeAwareHistoryClient(include_delisted=True)
+    first = make_pipeline(tmp_path, client, checkpoint_generation="first")
+    first.run(date(2025, 1, 8), full=True)
+    path = (
+        first._checkpoint_directory("1990-12-01", "2025-01-07")
+        / "runs/first/symbols/600999.csv"
+    )
+    if cache_state == "missing":
+        path.unlink()
+    elif cache_state == "corrupt":
+        path.write_text("broken")
+    else:
+        history = first._read_symbol_checkpoint(
+            path, "600999", "1990-12-01", "2025-01-07"
+        )
+        first._save_symbol_checkpoint(
+            path,
+            history.loc[history["date"] <= "2025-01-06"],
+            "1990-12-01",
+            "2025-01-06",
+        )
+    client.history_requests.clear()
+    history = make_pipeline(
+        tmp_path, client, checkpoint_generation="next"
+    )._stock_history(
+        "600999",
+        "1990-12-01",
+        "2025-01-07",
+        refresh_start="2025-01-08",
+    )
+    assert client.history_requests == [("600999", "1990-12-01", "2025-01-07")]
+    assert history["date"].max() == "2025-01-07"
