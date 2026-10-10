@@ -397,3 +397,205 @@ def test_incomplete_current_alternative_and_missing_delisted_list_fail_closed():
 
     with pytest.raises(MarketDataUnavailable, match="delisted"):
         AkshareClient(api=MissingDelistedApi(), delays=()).get_security_universe()
+
+
+def test_missing_share_capital_recovers_prices_without_eastmoney_or_skipping_stock():
+    class NullShareCapitalApi(FakeAkshareApi):
+        def stock_zh_a_daily(self, **kwargs):
+            raise JSONDecodeError("No value to decode")
+
+        def stock_zh_a_hist(self, **kwargs):
+            pytest.fail("complete Sina prices should prevent Eastmoney request")
+
+    calls = []
+
+    def prices(symbol, start, end):
+        calls.append((symbol, start, end))
+        return pd.DataFrame(
+            {
+                "date": ["2026-07-10", "2026-07-13"],
+                "close": [0.51, 0.51],
+                "volume": [100, 100],
+                "amount": [51, 51],
+            }
+        )
+
+    result = AkshareClient(
+        api=NullShareCapitalApi(), delays=(), sina_price_history=prices
+    ).get_stock_history("000004", "2025-01-01", "2026-10-10")
+    assert calls == [("sz000004", "2025-01-01", "2026-10-10")]
+    assert result["date"].tolist() == ["2026-07-10", "2026-07-13"]
+    assert result["symbol"].tolist() == ["000004", "000004"]
+    assert result["is_suspended"].tolist() == [False, False]
+
+
+def test_price_fallback_failure_still_tries_eastmoney():
+    class UnavailableApi(FakeAkshareApi):
+        def stock_zh_a_daily(self, **kwargs):
+            raise JSONDecodeError("null shares")
+
+    def unavailable(*args):
+        raise TimeoutError("price timeout")
+
+    api = UnavailableApi()
+    result = AkshareClient(
+        api=api, delays=(), sina_price_history=unavailable
+    ).get_stock_history("000004", "2025-01-01", "2026-10-10")
+    assert not result.empty
+    assert api.history_request["symbol"] == "000004"
+
+
+def test_all_three_sources_failure_preserves_each_cause():
+    class UnavailableApi(FakeAkshareApi):
+        def stock_zh_a_daily(self, **kwargs):
+            raise JSONDecodeError("null shares")
+
+        def stock_zh_a_hist(self, **kwargs):
+            raise ProxyError("Eastmoney disconnected")
+
+    def unavailable(*args):
+        raise MarketDataSchemaError("bad price assignment")
+
+    with pytest.raises(MarketDataUnavailable) as caught:
+        AkshareClient(
+            api=UnavailableApi(), delays=(), sina_price_history=unavailable
+        ).get_stock_history("000004", "2025-01-01", "2026-10-10")
+    assert [item["source"] for item in caught.value.failures] == [
+        "sina.daily",
+        "sina.prices",
+        "eastmoney.hist",
+    ]
+
+
+RAW_PRICE_ROWS = [
+    {"date": "2024-12-31T00:00:00.000Z", "close": 0.5, "volume": 100, "amount": 50},
+    {"date": "2026-07-10T00:00:00.000Z", "close": 0.51, "volume": 100, "amount": 51},
+    {"date": "2026-07-13T00:00:00.000Z", "close": 0.51, "volume": 100, "amount": 51},
+]
+
+
+def mock_sina_price_payload(
+    monkeypatch, text='var KLC_K2_sz000004="K2/ABC";', rows=...
+):
+    import py_mini_racer
+    import requests
+
+    calls = []
+
+    class Reply:
+        def __init__(self):
+            self.text = text
+
+        def raise_for_status(self):
+            calls.append("checked HTTP status")
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        return Reply()
+
+    class Decoder:
+        def eval(self, source):
+            from akshare.stock.cons import hk_js_decode
+
+            assert source == hk_js_decode
+
+        def call(self, name, payload):
+            calls.append((name, payload))
+            return RAW_PRICE_ROWS if rows is ... else rows
+
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(py_mini_racer, "MiniRacer", Decoder)
+    return calls
+
+
+def test_raw_sina_prices_are_bounded_and_preserve_identical_dated_turnover(monkeypatch):
+    calls = mock_sina_price_payload(monkeypatch)
+    result = AkshareClient._sina_price_history("sz000004", "2025-01-01", "2026-10-10")
+    assert result["date"].tolist() == ["2026-07-10", "2026-07-13"]
+    assert result["close"].tolist() == [0.51, 0.51]
+    assert calls[0][1] == {"timeout": 20}
+    assert "checked HTTP status" in calls
+    assert calls[-1] == ("d", "K2/ABC")
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "var KLC_K2_sz000004=null;",
+        'var KLC_K2_sz000001="K2/ABC";',
+        'var KLC_K2_sz000004="K2/ABC"; alert("unexpected script");',
+        "<html>upstream unavailable</html>",
+    ],
+)
+def test_raw_sina_rejects_null_wrong_symbol_and_extra_code(monkeypatch, payload):
+    calls = mock_sina_price_payload(monkeypatch, text=payload)
+    with pytest.raises(MarketDataSchemaError, match="assignment"):
+        AkshareClient._sina_price_history("sz000004", "2025-01-01", "2026-10-10")
+    assert not any(isinstance(item, tuple) and item[0] == "d" for item in calls)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [],
+        None,
+        {},
+        ["invalid row"],
+        [{"date": "2026-07-13", "close": 0.51, "volume": 100}],
+        [RAW_PRICE_ROWS[-1], RAW_PRICE_ROWS[-1]],
+        [{**RAW_PRICE_ROWS[-1], "amount": None}],
+        [{**RAW_PRICE_ROWS[-1], "close": float("inf")}],
+    ],
+)
+def test_raw_sina_rejects_incomplete_or_duplicate_rows(monkeypatch, rows):
+    mock_sina_price_payload(monkeypatch, rows=rows)
+    with pytest.raises(MarketDataSchemaError):
+        AkshareClient._sina_price_history("sz000004", "2025-01-01", "2026-10-10")
+
+
+def test_empty_post_delisting_request_does_not_invent_prices(monkeypatch):
+    mock_sina_price_payload(monkeypatch)
+    result = AkshareClient._sina_price_history("sz000004", "2026-07-14", "2026-10-10")
+    assert result.empty
+
+
+@pytest.mark.parametrize(
+    "suffix", ["\n/* wlSZEhybD7iGzvb1xBU4BjcGg6+4CD */", "\n/* first */\n/* second */"]
+)
+def test_raw_sina_accepts_trailing_block_comments_without_evaluating_them(
+    monkeypatch, suffix
+):
+    mock_sina_price_payload(monkeypatch, text='var KLC_K2_sz000004="K2/ABC";' + suffix)
+    result = AkshareClient._sina_price_history("sz000004", "2025-01-01", "2026-10-10")
+    assert len(result) == 2
+
+
+def test_comment_does_not_hide_executable_trailing_code(monkeypatch):
+    mock_sina_price_payload(
+        monkeypatch,
+        text='var KLC_K2_sz000004="K2/ABC"; /* first */ alert("extra"); /* last */',
+    )
+    with pytest.raises(MarketDataSchemaError, match="assignment"):
+        AkshareClient._sina_price_history("sz000004", "2025-01-01", "2026-10-10")
+
+
+def test_raw_sina_http_failure_switches_to_eastmoney_without_retry(monkeypatch):
+    import requests
+
+    class FailedDaily(FakeAkshareApi):
+        def stock_zh_a_daily(self, **kwargs):
+            raise MarketDataSchemaError("auxiliary capital unavailable")
+
+    def denied(*args, **kwargs):
+        raise requests.HTTPError("404 missing price payload")
+
+    sleeps = []
+    client = AkshareClient(
+        api=FailedDaily(),
+        sleeper=sleeps.append,
+        sina_price_history=AkshareClient._sina_price_history,
+    )
+    monkeypatch.setattr(requests, "get", denied)
+    history = client.get_stock_history("000004", "2025-01-01", "2026-10-10")
+    assert not history.empty
+    assert sleeps == []

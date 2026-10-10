@@ -30,9 +30,15 @@ data actually changed.
 Offline data tests run before any live fetch, and a separate read-only PR workflow
 checks the adapter and pipeline. The AKShare client retries transient network,
 timeout, rate-limit, and server failures with delays of 30, 90, and 180 seconds.
-Stock and index history switch from Sina to Eastmoney after a controlled network,
-parse, or response-schema failure. Current listings can use the two Eastmoney
-exchange lists if the exchange-backed list is unavailable; delisted lists remain
+Stock history first uses AKShare's Sina daily adapter. If that adapter fails,
+it can read Sina's original unadjusted price payload without querying optional
+circulating share capital; this preserves price history when the share-capital
+response is null. The bundled AKShare decoder reads only the validated price
+assignment, with a 20-second HTTP timeout. It preserves dated close, volume and
+amount rows, including distinct dates with identical prices, without filling
+missing rows. Eastmoney remains the stock fallback; index history can also
+switch from Sina to Eastmoney after controlled upstream failures. Current listings
+can use the two Eastmoney exchange lists if the exchange-backed list is unavailable; delisted lists remain
 required. Every candidate response must satisfy the same data contract.
 Source failures log structured stage, symbol, source, date range, and exception
 records. A failed stock does not stop collecting other symbols: successful
@@ -60,7 +66,11 @@ index coverage and security-universe fingerprints. CSV hashes, row counts,
 symbols, and coverage bounds must also validate. Expired or incompatible runs
 refetch; old v3 checkpoints are ignored. A new full generation after success
 refetches history, while routine generations refresh at least the latest five
-trading days so upstream corrections replace cached rows. Each symbol cache
+trading days so upstream corrections replace cached rows. Stock requests end at
+the earlier of the run date and the security's delisting date. A routine run whose
+refresh window begins after delisting reuses a completed lifecycle only when the
+successful cache covers exactly that end date; missing or partial caches still
+fetch the historical range, and full runs still refetch. Each symbol cache
 retains only one valid pre-2025 baseline row plus the 2025-onward window.
 
 To recover historical data, open **Actions → Update market breadth data → Run
