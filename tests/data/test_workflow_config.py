@@ -23,7 +23,9 @@ def test_workflow_restores_and_always_saves_cross_runner_checkpoints():
         if step.get("uses") == "actions/cache/restore@v4"
     )
     update_index = next(
-        index for index, step in enumerate(steps) if step.get("name") == "Update market data"
+        index
+        for index, step in enumerate(steps)
+        if step.get("name") == "Update market data"
     )
     save_index, save = next(
         (index, step)
@@ -32,7 +34,7 @@ def test_workflow_restores_and_always_saves_cross_runner_checkpoints():
     )
 
     checkpoint_path = "work/market-data-checkpoints"
-    stable_prefix = "market-data-checkpoints-v3-akshare-unadjusted-${{ runner.os }}-"
+    stable_prefix = "market-data-checkpoints-v4-akshare-unadjusted-${{ runner.os }}-"
     assert restore_index < update_index < save_index
     assert restore["id"] == "checkpoint_cache"
     assert restore["with"]["path"] == checkpoint_path
@@ -57,4 +59,24 @@ def test_workflow_reuses_one_checkpoint_generation_across_run_attempts():
 
     assert update["env"]["MARKET_DATA_CHECKPOINT_GENERATION"] == (
         "${{ github.run_id }}"
+    )
+
+
+def test_offline_tests_precede_network_fetch():
+    workflow = yaml.safe_load(Path(".github/workflows/update-data.yml").read_text())
+    names = [step.get("name") for step in workflow["jobs"]["update"]["steps"]]
+    assert names.index("Test data pipeline before fetching") < names.index(
+        "Update market data"
+    )
+
+
+def test_pr_ci_is_offline_and_has_no_publish_step():
+    workflow = yaml.safe_load(Path(".github/workflows/test-data.yml").read_text())
+    assert "pull_request" in workflow["on"]
+    assert workflow["permissions"] == {"contents": "read"}
+    commands = [step.get("run", "") for step in workflow["jobs"]["test"]["steps"]]
+    assert "python -m pytest tests/data -v" in commands
+    assert not any(
+        "update_market_data.py" in command or "git push" in command
+        for command in commands
     )

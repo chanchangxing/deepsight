@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -16,14 +18,16 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from .akshare_client import AkshareClient
+from .akshare_client import AkshareClient, MarketDataUnavailable
 from .calculations import add_cumulative_diff, calculate_index_changes, classify_breadth
 
 
 HISTORY_START = date(2025, 1, 1)
 INDEX_LOOKBACK_DAYS = 31
 STOCK_HISTORY_START = date(1990, 12, 1)
-CHECKPOINT_NAMESPACE = "v3-akshare-unadjusted"
+CHECKPOINT_NAMESPACE = "v4-akshare-unadjusted"
+FAILED_RESUME_MAX_AGE = timedelta(hours=12)
+LOGGER = logging.getLogger(__name__)
 RECENT_VALID_COUNT_DAYS = 5
 MIN_VALID_COUNT_RATIO = 0.60
 MAX_MISSING_PRICE_OR_COMPARISON_RATIO = 0.20
@@ -122,6 +126,7 @@ class MarketDataPipeline:
             raise ValueError("checkpoint generation contains unsafe characters")
         self._active_checkpoint_generation = checkpoint_generation
 
+        self._failures = []
         existing = self._read_history()
         validate_history(existing)
         index_history = self._index_history(as_of)
@@ -150,17 +155,14 @@ class MarketDataPipeline:
             return UpdateResult((), skipped=True)
         recent_dates = index_dates if full else index_dates[-5:]
         dates_to_update = [
-            value for value in index_dates if value in set(missing_dates).union(recent_dates)
+            value
+            for value in index_dates
+            if value in set(missing_dates).union(recent_dates)
         ]
         if not dates_to_update:
             return UpdateResult((), skipped=True)
 
-        refresh_start = (
-            HISTORY_START.isoformat() if full else min(dates_to_update)
-        )
-        self._prepare_checkpoint_generation(
-            full=full, as_of=as_of.isoformat(), refresh_start=refresh_start
-        )
+        refresh_start = HISTORY_START.isoformat() if full else min(dates_to_update)
         replacements = self._collect_records(
             index_history,
             dates_to_update,
@@ -170,8 +172,14 @@ class MarketDataPipeline:
             refresh_start=refresh_start,
         )
         retained = existing.loc[~existing["date"].isin(dates_to_update)]
-        combined = replacements if retained.empty else pd.concat([retained, replacements], ignore_index=True)
-        combined = combined.loc[:, REQUIRED_COLUMNS].sort_values("date").reset_index(drop=True)
+        combined = (
+            replacements
+            if retained.empty
+            else pd.concat([retained, replacements], ignore_index=True)
+        )
+        combined = (
+            combined.loc[:, REQUIRED_COLUMNS].sort_values("date").reset_index(drop=True)
+        )
         combined = add_cumulative_diff(combined).loc[:, REQUIRED_COLUMNS]
         validate_history(combined)
         if self._history_csv_bytes(combined) == self._history_csv_bytes(existing):
@@ -232,38 +240,80 @@ class MarketDataPipeline:
         full: bool,
         refresh_start: str,
     ) -> pd.DataFrame:
-        market = self.client.get_security_universe().copy()
-        required_market_columns = {"symbol", "exchange", "listing_date", "delisting_date"}
+        try:
+            market = self.client.get_security_universe().copy()
+        except (RuntimeError, ValueError) as error:
+            self._record_failure("universe", None, None, as_of.isoformat(), error)
+            raise
+        required_market_columns = {
+            "symbol",
+            "exchange",
+            "listing_date",
+            "delisting_date",
+        }
         if not required_market_columns.issubset(market.columns):
-            raise MarketDataValidationError("market snapshot is missing symbol or exchange")
+            raise MarketDataValidationError(
+                "market snapshot is missing symbol or exchange"
+            )
         market["symbol"] = market["symbol"].astype(str).str.zfill(6)
         if market["symbol"].duplicated().any():
             raise MarketDataValidationError("duplicate symbols")
         exchanges = set(market["exchange"])
         if not {"SH", "SZ"}.issubset(exchanges):
-            raise MarketDataValidationError("both Shanghai and Shenzhen markets are required")
+            raise MarketDataValidationError(
+                "both Shanghai and Shenzhen markets are required"
+            )
 
         market = market.loc[
             market["delisting_date"].isna()
             | (market["delisting_date"] >= HISTORY_START.isoformat())
         ].reset_index(drop=True)
 
+        self._prepare_checkpoint_generation(
+            full=full,
+            as_of=as_of.isoformat(),
+            refresh_start=refresh_start,
+            coverage={
+                "index_sha256": hashlib.sha256(
+                    index_history.to_csv(index=False).encode()
+                ).hexdigest(),
+                "universe_sha256": hashlib.sha256(
+                    market.sort_values("symbol").to_csv(index=False).encode()
+                ).hexdigest(),
+            },
+        )
         history_start = STOCK_HISTORY_START.isoformat()
         histories = []
+        failures = []
         for symbol in market["symbol"]:
-            history = self._stock_history(
-                symbol,
-                history_start,
-                as_of.isoformat(),
-                full=full,
-                refresh_start=refresh_start,
-            ).copy()
-            if not {"date", "current_close"}.issubset(history.columns):
-                raise MarketDataValidationError(f"stock history is incomplete for {symbol}")
-            history["symbol"] = symbol
-            if "is_suspended" not in history:
-                history["is_suspended"] = False
-            histories.append(history[["date", "symbol", "current_close", "is_suspended"]])
+            try:
+                history = self._stock_history(
+                    symbol,
+                    history_start,
+                    as_of.isoformat(),
+                    full=full,
+                    refresh_start=refresh_start,
+                ).copy()
+                if not {"date", "current_close"}.issubset(history.columns):
+                    raise MarketDataValidationError(
+                        f"stock history is incomplete for {symbol}"
+                    )
+                history["symbol"] = symbol
+                if "is_suspended" not in history:
+                    history["is_suspended"] = False
+                histories.append(
+                    history[["date", "symbol", "current_close", "is_suspended"]]
+                )
+            except (RuntimeError, ValueError) as error:
+                failures.append(symbol)
+                self._record_failure(
+                    "stock_history", symbol, history_start, as_of.isoformat(), error
+                )
+        if failures:
+            raise MarketDataUnavailable(
+                f"stock history failed for {len(failures)} symbol(s): {', '.join(failures)}; "
+                "successful checkpoints saved; publication blocked"
+            )
         if not histories:
             raise MarketDataValidationError("empty market snapshot")
 
@@ -272,18 +322,20 @@ class MarketDataPipeline:
             prices["date"] = pd.to_datetime(prices["date"], errors="raise").dt.strftime(
                 "%Y-%m-%d"
             )
-            prices["current_close"] = pd.to_numeric(prices["current_close"], errors="raise")
+            prices["current_close"] = pd.to_numeric(
+                prices["current_close"], errors="raise"
+            )
         except (TypeError, ValueError) as error:
-            raise MarketDataValidationError(f"invalid stock history: {error}") from error
+            raise MarketDataValidationError(
+                f"invalid stock history: {error}"
+            ) from error
         prices = prices.loc[prices["date"] <= as_of.isoformat()].sort_values(
             ["symbol", "date"]
         )
         if prices.duplicated(["symbol", "date"]).any():
             raise MarketDataValidationError("duplicate stock history dates")
         first_valid_dates = (
-            prices.loc[prices["current_close"].gt(0)]
-            .groupby("symbol")["date"]
-            .min()
+            prices.loc[prices["current_close"].gt(0)].groupby("symbol")["date"].min()
         )
         market["listing_date"] = market["listing_date"].fillna(
             market["symbol"].map(first_valid_dates)
@@ -291,21 +343,25 @@ class MarketDataPipeline:
         valid_closes = prices["current_close"].where(
             prices["current_close"].gt(0) & ~prices["is_suspended"].fillna(False)
         )
-        prices["previous_close"] = valid_closes.groupby(prices["symbol"], sort=False).transform(
-            lambda closes: closes.ffill().shift()
-        )
+        prices["previous_close"] = valid_closes.groupby(
+            prices["symbol"], sort=False
+        ).transform(lambda closes: closes.ffill().shift())
 
         index_changes = calculate_index_changes(index_history).set_index("date")
         records = []
         for value in dates_to_update:
             active_market = market.loc[
                 (market["listing_date"].isna() | (market["listing_date"] <= value))
-                & (market["delisting_date"].isna() | (market["delisting_date"] >= value))
+                & (
+                    market["delisting_date"].isna()
+                    | (market["delisting_date"] >= value)
+                )
             ]
             daily_prices = active_market[["symbol", "exchange"]].merge(
-                prices.loc[prices["date"] == value, [
-                    "symbol", "current_close", "is_suspended", "previous_close"
-                ]],
+                prices.loc[
+                    prices["date"] == value,
+                    ["symbol", "current_close", "is_suspended", "previous_close"],
+                ],
                 on="symbol",
                 how="left",
             )
@@ -315,21 +371,25 @@ class MarketDataPipeline:
                 if pending_records.empty
                 else pd.concat([existing, pending_records], ignore_index=True)
             )
-            self._validate_daily_quality(value, daily_prices, active_market, quality_history)
+            self._validate_daily_quality(
+                value, daily_prices, active_market, quality_history
+            )
             counts = classify_breadth(daily_prices)
             if counts.valid == 0:
                 raise MarketDataValidationError(f"no valid stock prices for {value}")
             active_by_exchange = active_market.groupby("exchange").size()
-            valid_by_exchange = daily_prices.loc[
-                self._valid_price_mask(daily_prices)
-            ].groupby("exchange").size()
+            valid_by_exchange = (
+                daily_prices.loc[self._valid_price_mask(daily_prices)]
+                .groupby("exchange")
+                .size()
+            )
             required_exchanges = {
-                exchange
-                for exchange, size in active_by_exchange.items()
-                if size > 1
+                exchange for exchange, size in active_by_exchange.items() if size > 1
             }
             if not required_exchanges.issubset(valid_by_exchange.index):
-                raise MarketDataValidationError(f"missing valid exchange breadth for {value}")
+                raise MarketDataValidationError(
+                    f"missing valid exchange breadth for {value}"
+                )
             index = index_changes.loc[value]
             records.append(
                 {
@@ -361,17 +421,22 @@ class MarketDataPipeline:
             checkpoint_root / "runs" / self._checkpoint_generation / "symbols"
         )
         generation_checkpoint = generation_directory / f"{symbol}.csv"
-        if generation_checkpoint.exists():
-            try:
-                checkpoint = pd.read_csv(
-                    generation_checkpoint,
-                    dtype={"date": str, "symbol": str},
-                )
-                return self._trim_stock_history(self._validated_stock_history(
-                    checkpoint, symbol, start, end
-                ))
-            except (OSError, ValueError, pd.errors.ParserError):
-                generation_checkpoint.unlink(missing_ok=True)
+        for generation in [
+            self._checkpoint_generation,
+            *getattr(self, "_resume_generations", []),
+        ]:
+            candidate = (
+                checkpoint_root / "runs" / generation / "symbols" / f"{symbol}.csv"
+            )
+            checkpoint = self._read_symbol_checkpoint(
+                candidate, symbol, start, end, exact_end=True
+            )
+            if checkpoint is not None:
+                if candidate != generation_checkpoint:
+                    self._save_symbol_checkpoint(
+                        generation_checkpoint, checkpoint, start, end
+                    )
+                return checkpoint
 
         successful = self._read_successful_checkpoint(
             checkpoint_root, symbol, start, end
@@ -405,14 +470,10 @@ class MarketDataPipeline:
         )
         checkpoint = self._validated_stock_history(checkpoint, symbol, start, end)
         checkpoint = self._trim_stock_history(checkpoint)
-        payload = checkpoint.to_csv(index=False).encode("utf-8")
-        checkpoint_temp = self._write_temp(generation_checkpoint, payload)
-        try:
-            os.replace(checkpoint_temp, generation_checkpoint)
-            self._fsync_directory(generation_checkpoint.parent)
-        finally:
-            checkpoint_temp.unlink(missing_ok=True)
-        return checkpoint.loc[checkpoint["date"].between(start, end)].reset_index(drop=True)
+        self._save_symbol_checkpoint(generation_checkpoint, checkpoint, start, end)
+        return checkpoint.loc[checkpoint["date"].between(start, end)].reset_index(
+            drop=True
+        )
 
     def _read_successful_checkpoint(
         self, checkpoint_root: Path, symbol: str, start: str, end: str
@@ -428,12 +489,7 @@ class MarketDataPipeline:
             checkpoint_path = (
                 checkpoint_root / "runs" / generation / "symbols" / f"{symbol}.csv"
             )
-            checkpoint = pd.read_csv(
-                checkpoint_path, dtype={"date": str, "symbol": str}
-            )
-            return self._trim_stock_history(
-                self._validated_stock_history(checkpoint, symbol, start, end)
-            )
+            return self._read_symbol_checkpoint(checkpoint_path, symbol, start, end)
         except (
             FileNotFoundError,
             KeyError,
@@ -444,6 +500,82 @@ class MarketDataPipeline:
             pd.errors.ParserError,
         ):
             return None
+
+    @property
+    def _source_version(self) -> str:
+        return getattr(self.client, "cache_version", "injected-unadjusted-v2")
+
+    def _read_symbol_checkpoint(self, path, symbol, start, end, *, exact_end=False):
+        try:
+            metadata = json.loads(path.with_suffix(".json").read_text())
+            payload = path.read_bytes()
+            if (
+                metadata["schema"] != 1
+                or metadata["source_version"] != self._source_version
+                or metadata["start"] != start
+                or metadata["end"] > end
+                or (exact_end and metadata["end"] != end)
+                or metadata["sha256"] != hashlib.sha256(payload).hexdigest()
+            ):
+                return None
+            frame = pd.read_csv(io.BytesIO(payload), dtype={"date": str, "symbol": str})
+            if frame.empty or len(frame) != metadata["rows"]:
+                return None
+            return self._trim_stock_history(
+                self._validated_stock_history(
+                    frame, symbol, metadata["start"], metadata["end"]
+                )
+            )
+        except (OSError, KeyError, TypeError, ValueError, pd.errors.ParserError):
+            return None
+
+    def _save_symbol_checkpoint(self, path, frame, start, end):
+        payload = frame.to_csv(index=False).encode("utf-8")
+        metadata = {
+            "schema": 1,
+            "source_version": self._source_version,
+            "start": start,
+            "end": end,
+            "rows": len(frame),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        # The sidecar is the completion marker. A torn pair fails hash validation.
+        for target, data in [
+            (path, payload),
+            (path.with_suffix(".json"), json.dumps(metadata).encode()),
+        ]:
+            temporary = self._write_temp(target, data)
+            try:
+                os.replace(temporary, target)
+                self._fsync_directory(target.parent)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+    def _record_failure(self, stage, symbol, start, end, error):
+        failure = {
+            "stage": stage,
+            "symbol": symbol,
+            "start": start,
+            "end": end,
+            "exception": type(error).__name__,
+            "message": str(error),
+            "sources": getattr(error, "failures", []),
+        }
+        LOGGER.error(json.dumps(failure, ensure_ascii=False))
+        self._failures = [*getattr(self, "_failures", []), failure]
+        target = (
+            self._checkpoint_directory(STOCK_HISTORY_START.isoformat(), "")
+            / "runs"
+            / self._checkpoint_generation
+            / "failures.json"
+        )
+        temporary = self._write_temp(
+            target, json.dumps(self._failures, ensure_ascii=False).encode()
+        )
+        try:
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _trim_stock_history(frame: pd.DataFrame) -> pd.DataFrame:
@@ -457,7 +589,12 @@ class MarketDataPipeline:
         return pd.concat([before_window, in_window], ignore_index=True)
 
     def _prepare_checkpoint_generation(
-        self, *, full: bool, as_of: str, refresh_start: str
+        self,
+        *,
+        full: bool,
+        as_of: str,
+        refresh_start: str,
+        coverage: dict | None = None,
     ) -> None:
         checkpoint_root = self._checkpoint_directory(
             STOCK_HISTORY_START.isoformat(), ""
@@ -466,13 +603,43 @@ class MarketDataPipeline:
             checkpoint_root / "runs" / self._checkpoint_generation / "run.json"
         )
         metadata = {
-            "schema": 1,
+            "schema": 2,
+            "source_version": self._source_version,
+            "coverage": coverage,
             "generation": self._checkpoint_generation,
             "mode": "full" if full else "routine",
             "as_of": as_of,
             "history_start": STOCK_HISTORY_START.isoformat(),
             "refresh_start": refresh_start,
         }
+        signature = lambda value: {
+            key: item
+            for key, item in value.items()
+            if key not in {"generation", "created_at"}
+        }
+        now = self.now().astimezone(timezone.utc)
+        metadata["created_at"] = now.isoformat()
+        self._resume_generations = []
+        for candidate in sorted(
+            metadata_path.parent.parent.glob("*/run.json"), reverse=True
+        ):
+            if (
+                candidate == metadata_path
+                or (candidate.parent / "success.json").exists()
+            ):
+                continue
+            try:
+                previous = json.loads(candidate.read_text())
+                if not isinstance(previous, dict):
+                    continue
+                age = now - datetime.fromisoformat(previous["created_at"])
+                if (
+                    signature(previous) == signature(metadata)
+                    and timedelta(0) <= age <= FAILED_RESUME_MAX_AGE
+                ):
+                    self._resume_generations.append(candidate.parent.name)
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
         if metadata_path.exists():
             try:
                 existing = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -480,11 +647,20 @@ class MarketDataPipeline:
                 raise MarketDataValidationError(
                     f"cannot read checkpoint generation metadata: {error}"
                 ) from error
-            if existing != metadata:
+            if not isinstance(existing, dict) or signature(existing) != signature(
+                metadata
+            ):
                 raise MarketDataValidationError(
                     "checkpoint generation metadata does not match this run"
                 )
-            return
+            try:
+                age = now - datetime.fromisoformat(existing["created_at"])
+            except (KeyError, TypeError, ValueError):
+                age = FAILED_RESUME_MAX_AGE + timedelta(seconds=1)
+            if timedelta(0) <= age <= FAILED_RESUME_MAX_AGE:
+                return
+            # An old run attempt must also refresh prices, even with the same run ID.
+            shutil.rmtree(metadata_path.parent / "symbols", ignore_errors=True)
         metadata_bytes = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
         metadata_temp = self._write_temp(metadata_path, metadata_bytes)
         try:
@@ -497,6 +673,14 @@ class MarketDataPipeline:
         checkpoint_root = self._checkpoint_directory(
             STOCK_HISTORY_START.isoformat(), ""
         )
+        success_path = (
+            checkpoint_root / "runs" / self._checkpoint_generation / "success.json"
+        )
+        success_temp = self._write_temp(success_path, b'{"success":true}')
+        try:
+            os.replace(success_temp, success_path)
+        finally:
+            success_temp.unlink(missing_ok=True)
         pointer_path = checkpoint_root / "latest-success.json"
         pointer_bytes = json.dumps(
             {"schema": 1, "generation": self._checkpoint_generation},
@@ -547,12 +731,16 @@ class MarketDataPipeline:
             raise ValueError("checkpoint symbol does not match")
         suspended_values = result["is_suspended"]
         if not pd.api.types.is_bool_dtype(suspended_values):
-            normalized = suspended_values.astype(str).str.lower().map(
-                {"true": True, "false": False}
+            normalized = (
+                suspended_values.astype(str)
+                .str.lower()
+                .map({"true": True, "false": False})
             )
             if normalized.isna().any():
                 raise ValueError("checkpoint suspension flag is invalid")
             result["is_suspended"] = normalized.astype(bool)
+        if result.empty or result["date"].isna().any():
+            raise ValueError("checkpoint has no usable dated rows")
         if not result["date"].between(start, end).all():
             raise ValueError("checkpoint dates fall outside its coverage")
         if result["date"].duplicated().any():
