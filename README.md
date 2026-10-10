@@ -27,8 +27,18 @@ post-close source availability. Each run refreshes the recent trading days,
 validates the complete data pipeline, and creates a commit only when published
 data actually changed.
 
-The AKShare client retries transient network and rate-limit failures with delays
-of 30, 90, and 180 seconds. A failed fetch or validation fails the Action and
+Offline data tests run before any live fetch, and a separate read-only PR workflow
+checks the adapter and pipeline. The AKShare client retries transient network,
+timeout, rate-limit, and server failures with delays of 30, 90, and 180 seconds.
+Stock and index history switch from Sina to Eastmoney after a controlled network,
+parse, or response-schema failure. Current listings can use the two Eastmoney
+exchange lists if the exchange-backed list is unavailable; delisted lists remain
+required. Every candidate response must satisfy the same data contract.
+Source failures log structured stage, symbol, source, date range, and exception
+records. A failed stock does not stop collecting other symbols: successful
+checkpoints are saved and failures are recorded in the private run directory.
+Any stock fetch failure blocks publication. A failed fetch or validation fails
+the Action and
 does not advance the published version pointer, so the previous release remains
 available. Inspect the failed run in the repository's **Actions** tab for the
 command and error output before retrying.
@@ -44,8 +54,12 @@ pointer and makes interrupted mirror updates deterministically recoverable.
 Private per-symbol checkpoints live below `work/market-data-checkpoints/` and
 are restored by GitHub Actions across runs. They are namespaced by source and
 data semantics, validated before reuse, and grouped by workflow generation.
-Retries of one generation reuse completed symbols; a new full generation
-refetches history, while routine generations refetch at least the latest five
+Failed runs can reuse completed symbols from another failed generation only
+within 12 hours and with identical mode, date bounds, AKShare/adapter version,
+index coverage and security-universe fingerprints. CSV hashes, row counts,
+symbols, and coverage bounds must also validate. Expired or incompatible runs
+refetch; old v3 checkpoints are ignored. A new full generation after success
+refetches history, while routine generations refresh at least the latest five
 trading days so upstream corrections replace cached rows. Each symbol cache
 retains only one valid pre-2025 baseline row plus the 2025-onward window.
 

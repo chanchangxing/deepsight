@@ -2,7 +2,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -337,24 +337,23 @@ def test_successful_publish_keeps_canonical_csv_identical_to_current_version(tmp
 def test_full_run_resumes_completed_stock_history_after_failure(tmp_path):
     client = FailsOnceDuringStockHistoryClient()
 
-    with pytest.raises(RuntimeError, match="simulated interrupted"):
-        make_pipeline(
-            tmp_path, client, checkpoint_generation="full-attempt-1"
-        ).run(date(2025, 1, 6), full=True)
+    with pytest.raises(RuntimeError, match="publication blocked"):
+        make_pipeline(tmp_path, client, checkpoint_generation="full-attempt-1").run(
+            date(2025, 1, 6), full=True
+        )
 
     metadata_path = (
         tmp_path
-        / "work/market-data-checkpoints/v3-akshare-unadjusted"
+        / "work/market-data-checkpoints/v4-akshare-unadjusted"
         / "1990-12-01/runs/full-attempt-1/run.json"
     )
-    assert json.loads(metadata_path.read_text()) == {
-        "schema": 1,
-        "generation": "full-attempt-1",
-        "mode": "full",
-        "as_of": "2025-01-06",
-        "history_start": "1990-12-01",
-        "refresh_start": "2025-01-01",
-    }
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["schema"] == 2
+    assert metadata["generation"] == "full-attempt-1"
+    assert metadata["mode"] == "full"
+    assert metadata["as_of"] == "2025-01-06"
+    assert metadata["source_version"] == "injected-unadjusted-v2"
+    assert set(metadata["coverage"]) == {"index_sha256", "universe_sha256"}
 
     make_pipeline(tmp_path, client, checkpoint_generation="full-attempt-1").run(
         date(2025, 1, 6), full=True
@@ -388,9 +387,7 @@ def test_decades_response_retains_only_one_baseline_plus_window_rows(tmp_path):
         tmp_path, client, checkpoint_generation="bounded-generation"
     )
 
-    history = pipeline._stock_history(
-        "600000", "1990-12-01", "2025-01-31", full=True
-    )
+    history = pipeline._stock_history("600000", "1990-12-01", "2025-01-31", full=True)
 
     assert history["date"].tolist() == [
         "2024-12-31",
@@ -398,7 +395,7 @@ def test_decades_response_retains_only_one_baseline_plus_window_rows(tmp_path):
     ]
     checkpoint = pd.read_csv(
         tmp_path
-        / "work/market-data-checkpoints/v3-akshare-unadjusted"
+        / "work/market-data-checkpoints/v4-akshare-unadjusted"
         / "1990-12-01/runs/bounded-generation/symbols/600000.csv"
     )
     assert checkpoint["date"].tolist() == history["date"].tolist()
@@ -426,9 +423,7 @@ def test_synthetic_checkpoint_rows_scale_with_window_not_listing_age(tmp_path):
 def test_successful_generation_prunes_superseded_checkpoint_rows(tmp_path):
     client = DecadesHistoryClient(symbol_count=10)
     for generation in ("old-generation", "current-generation"):
-        pipeline = make_pipeline(
-            tmp_path, client, checkpoint_generation=generation
-        )
+        pipeline = make_pipeline(tmp_path, client, checkpoint_generation=generation)
         pipeline._prepare_checkpoint_generation(
             full=True, as_of="2025-01-31", refresh_start="2025-01-01"
         )
@@ -440,7 +435,7 @@ def test_successful_generation_prunes_superseded_checkpoint_rows(tmp_path):
 
     runs = (
         tmp_path
-        / "work/market-data-checkpoints/v3-akshare-unadjusted"
+        / "work/market-data-checkpoints/v4-akshare-unadjusted"
         / "1990-12-01/runs"
     )
     assert [path.name for path in runs.iterdir()] == ["current-generation"]
@@ -914,3 +909,133 @@ def test_rejects_excessive_missing_price_or_comparison_ratio_before_publish(tmp_
         make_pipeline(tmp_path, FixtureClient(invalid_symbols={"600000"})).run(date(2025, 1, 6))
 
     assert not (tmp_path / "public/data/current.json").exists()
+
+
+def test_failed_first_symbol_does_not_discard_later_success_and_pointer_is_unchanged(
+    tmp_path,
+):
+    make_pipeline(tmp_path).run(date(2025, 1, 3))
+    pointer = (tmp_path / "public/data/current.json").read_bytes()
+    csv = (tmp_path / "data/market_history.csv").read_bytes()
+
+    class FailingFirst(FixtureClient):
+        def get_stock_history(self, symbol, start, end):
+            if symbol == "600000":
+                raise RuntimeError("both sources failed")
+            return super().get_stock_history(symbol, start, end)
+
+    client = FailingFirst()
+    with pytest.raises(RuntimeError, match="publication blocked"):
+        make_pipeline(tmp_path, client, checkpoint_generation="failed").run(
+            date(2025, 1, 6), full=True
+        )
+    assert client.history_requests == [("000001", "1990-12-01", "2025-01-06")]
+    run = (
+        tmp_path
+        / "work/market-data-checkpoints/v4-akshare-unadjusted/1990-12-01/runs/failed"
+    )
+    assert (run / "symbols/000001.csv").exists()
+    assert not (run / "success.json").exists()
+    failure = json.loads((run / "failures.json").read_text())[0]
+    assert failure["symbol"] == "600000"
+    assert failure["end"] == "2025-01-06"
+    assert (tmp_path / "public/data/current.json").read_bytes() == pointer
+    assert (tmp_path / "data/market_history.csv").read_bytes() == csv
+
+
+def test_matching_failed_run_recovers_across_different_github_run_ids(tmp_path):
+    client = FailsOnceDuringStockHistoryClient()
+    with pytest.raises(RuntimeError):
+        make_pipeline(tmp_path, client, checkpoint_generation="run-a").run(
+            date(2025, 1, 6), full=True
+        )
+    assert not (tmp_path / "public/data/current.json").exists()
+    make_pipeline(tmp_path, client, checkpoint_generation="run-b").run(
+        date(2025, 1, 6), full=True
+    )
+    assert [symbol for symbol, _, _ in client.history_requests].count("600000") == 1
+    assert [symbol for symbol, _, _ in client.history_requests].count("000001") == 2
+    assert (tmp_path / "public/data/current.json").exists()
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "as_of",
+        "mode",
+        "source_version",
+        "coverage",
+        "expired",
+        "future",
+        "corrupt_csv",
+        "short_coverage",
+        "empty_csv",
+    ],
+)
+def test_incompatible_or_unverified_failed_checkpoints_are_refetched(tmp_path, changed):
+    client = FailsOnceDuringStockHistoryClient()
+    now = datetime(2025, 1, 6, 10, tzinfo=timezone.utc)
+    with pytest.raises(RuntimeError):
+        make_pipeline(
+            tmp_path, client, now=lambda: now, checkpoint_generation="run-a"
+        ).run(date(2025, 1, 6), full=True)
+    run = (
+        tmp_path
+        / "work/market-data-checkpoints/v4-akshare-unadjusted/1990-12-01/runs/run-a"
+    )
+    metadata = json.loads((run / "run.json").read_text())
+    if changed in {"as_of", "mode", "source_version"}:
+        metadata[changed] = "incompatible"
+    elif changed == "coverage":
+        metadata["coverage"]["universe_sha256"] = "changed"
+    elif changed in {"expired", "future"}:
+        metadata["created_at"] = (
+            now + timedelta(hours=-13 if changed == "expired" else 1)
+        ).isoformat()
+    elif changed == "corrupt_csv":
+        with (run / "symbols/600000.csv").open("a") as handle:
+            handle.write("corrupt")
+    elif changed == "empty_csv":
+        (run / "symbols/600000.csv").write_text(
+            "date,symbol,current_close,is_suspended\n"
+        )
+    elif changed == "short_coverage":
+        symbol_metadata = json.loads((run / "symbols/600000.json").read_text())
+        symbol_metadata["end"] = "2025-01-03"
+        (run / "symbols/600000.json").write_text(json.dumps(symbol_metadata))
+    (run / "run.json").write_text(json.dumps(metadata))
+    make_pipeline(tmp_path, client, now=lambda: now, checkpoint_generation="run-b").run(
+        date(2025, 1, 6), full=True
+    )
+    assert [symbol for symbol, _, _ in client.history_requests].count("600000") == 2
+
+
+def test_universe_failure_preserves_pointer_and_prevents_stock_fetch(tmp_path):
+    make_pipeline(tmp_path).run(date(2025, 1, 3))
+    pointer = (tmp_path / "public/data/current.json").read_bytes()
+
+    class UnavailableUniverse(FixtureClient):
+        def get_security_universe(self):
+            raise RuntimeError("all list sources unavailable")
+
+    client = UnavailableUniverse()
+    with pytest.raises(RuntimeError, match="list sources"):
+        make_pipeline(tmp_path, client).run(date(2025, 1, 6))
+    assert client.history_requests == []
+    assert (tmp_path / "public/data/current.json").read_bytes() == pointer
+
+
+def test_expired_retry_of_same_generation_refetches_completed_prices(tmp_path):
+    client = FailsOnceDuringStockHistoryClient()
+    now = datetime(2025, 1, 6, 10, tzinfo=timezone.utc)
+    with pytest.raises(RuntimeError):
+        make_pipeline(
+            tmp_path, client, now=lambda: now, checkpoint_generation="same-run"
+        ).run(date(2025, 1, 6), full=True)
+    make_pipeline(
+        tmp_path,
+        client,
+        now=lambda: now + timedelta(hours=13),
+        checkpoint_generation="same-run",
+    ).run(date(2025, 1, 6), full=True)
+    assert [symbol for symbol, _, _ in client.history_requests].count("600000") == 2

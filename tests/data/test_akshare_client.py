@@ -298,10 +298,102 @@ def test_get_stock_history_rejects_non_a_share_symbols_before_fetching(symbol):
 
 def test_schema_changes_raise_without_retrying():
     class BrokenApi:
+        def stock_zh_index_daily_em(self, **kwargs):
+            return pd.DataFrame({"日期": ["2025-01-02"]})
+
         def stock_zh_index_daily(self, **kwargs):
             return pd.DataFrame({"日期": ["2025-01-02"]})
 
     client = AkshareClient(api=BrokenApi(), sleeper=lambda _: pytest.fail("retried"))
 
-    with pytest.raises(MarketDataSchemaError, match="close"):
+    with pytest.raises(MarketDataUnavailable, match="close"):
         client.get_index_history("2025-01-01", "2025-01-03")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TimeoutError("timed out"),
+        ProxyError("remote disconnected"),
+        JSONDecodeError("No value to decode"),
+    ],
+)
+def test_stock_source_switches_after_controlled_upstream_errors(error, caplog):
+    class UnavailableSina(FakeAkshareApi):
+        def stock_zh_a_daily(self, **kwargs):
+            raise error
+
+    api = UnavailableSina()
+    result = AkshareClient(api=api, delays=()).get_stock_history(
+        "600000", "2025-01-01", "2025-01-03"
+    )
+    assert not result.empty
+    assert api.history_request["adjust"] == ""
+    import json
+
+    diagnostic = json.loads(caplog.records[0].message)
+    assert diagnostic["symbol"] == "600000"
+    assert diagnostic["source"] == "sina.daily"
+    assert diagnostic["start"] == "2025-01-01"
+    assert diagnostic["exception"] == type(error).__name__
+
+
+def test_both_stock_sources_fail_with_original_causes():
+    class UnavailableApi(FakeAkshareApi):
+        def stock_zh_a_daily(self, **kwargs):
+            raise JSONDecodeError("No value to decode")
+
+        def stock_zh_a_hist(self, **kwargs):
+            raise ProxyError("remote disconnected")
+
+    with pytest.raises(MarketDataUnavailable) as caught:
+        AkshareClient(api=UnavailableApi(), delays=()).get_stock_history(
+            "600000", "2025-01-01", "2025-01-03"
+        )
+    assert [item["source"] for item in caught.value.failures] == [
+        "sina.daily",
+        "eastmoney.hist",
+    ]
+    assert [item["exception"] for item in caught.value.failures] == [
+        "JSONDecodeError",
+        "ProxyError",
+    ]
+
+
+def test_programming_error_does_not_silently_switch_sources():
+    class BrokenApi(FakeAkshareApi):
+        def stock_zh_a_daily(self, **kwargs):
+            raise TypeError("programming error")
+
+    with pytest.raises(TypeError):
+        AkshareClient(api=BrokenApi()).get_stock_history(
+            "600000", "2025-01-01", "2025-01-03"
+        )
+
+
+def test_list_network_failure_uses_complete_current_alternative_and_keeps_delisted():
+    class UnavailableListApi(FakeAkshareApi):
+        def stock_info_a_code_name(self):
+            raise ConnectionError("SSE unreachable")
+
+    result = AkshareClient(api=UnavailableListApi(), delays=()).get_security_universe()
+    assert {"600999", "000999", "600000", "000001"}.issubset(set(result["symbol"]))
+
+
+def test_incomplete_current_alternative_and_missing_delisted_list_fail_closed():
+    class UnavailableListApi(FakeAkshareApi):
+        def stock_info_a_code_name(self):
+            raise ConnectionError("SSE unreachable")
+
+        def stock_sz_a_spot_em(self):
+            return super().stock_sz_a_spot_em().iloc[:0]
+
+    with pytest.raises(MarketDataUnavailable, match="both exchanges"):
+        AkshareClient(api=UnavailableListApi(), delays=()).get_security_universe()
+
+    class MissingDelistedApi(FakeAkshareApi):
+        def stock_info_sh_delist(self, **kwargs):
+            raise TimeoutError("delisted unavailable")
+
+    with pytest.raises(MarketDataUnavailable, match="delisted"):
+        AkshareClient(api=MissingDelistedApi(), delays=()).get_security_universe()

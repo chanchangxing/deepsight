@@ -29,9 +29,9 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: work/market-data-checkpoints
-          key: market-data-checkpoints-v3-akshare-unadjusted-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: market-data-checkpoints-v4-akshare-unadjusted-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            market-data-checkpoints-v3-akshare-unadjusted-${{ runner.os }}-
+            market-data-checkpoints-v4-akshare-unadjusted-${{ runner.os }}-
 
       - uses: actions/setup-python@v5
         with:
@@ -39,6 +39,9 @@ jobs:
 
       - name: Install Python dependencies
         run: python -m pip install -r requirements.txt
+
+      - name: Test data pipeline before fetching
+        run: python -m pytest tests/data -v
 
       - name: Update market data
         env:
@@ -56,9 +59,6 @@ jobs:
         with:
           path: work/market-data-checkpoints
           key: ${{ steps.checkpoint_cache.outputs.cache-primary-key }}
-
-      - name: Validate published data
-        run: python -m pytest tests/data -v
 
       - name: Commit published data when it changed
         run: |
